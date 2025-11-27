@@ -1,0 +1,22 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 核心大文件 (必须忽略!)
+data/
+dataset/
+imagenet/
+pretrained_models/
+output_*/
+*.pth
+*.ckpt
+*.safetensors
+
+# 系统/IDE配置
+.vscode/
+.idea/
+.DS_Store
+
+# 压缩包
+*.zip
+*.tar.gz
