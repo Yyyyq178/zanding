@@ -14,7 +14,6 @@ from timm.models.vision_transformer import Block
 from models.diffloss import DiffLoss
 
 
-# models/mar.py 开头位置
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     """
@@ -166,8 +165,6 @@ class MAR(nn.Module):
         # Diffusion 位置编码：这是给 DiffLoss 用的额外位置信息
         self.diffusion_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len, decoder_embed_dim))
 
-        self.initialize_weights()
-
         # --------------------------------------------------------------------------
         # Diffusion Loss
         # 实例化 DiffLoss 模块，它是一个独立的子网络 (MLP 或 Transformer)
@@ -180,6 +177,8 @@ class MAR(nn.Module):
             grad_checkpointing=grad_checkpointing
         )
         self.diffusion_batch_mul = diffusion_batch_mul
+
+        self.initialize_weights()
 
     def initialize_weights(self):
         # parameters
@@ -197,10 +196,17 @@ class MAR(nn.Module):
             grid_size_hr, 
             grid_size_lr
         )
+        # 赋值给 Encoder 和 Decoder
+        # unsqueeze(0) 是为了增加 Batch 维度: [1, Total_Len, Dim]
         self.encoder_pos_embed_learned.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        self.decoder_pos_embed_learned.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        # 赋值给 Diffusion (只取 HR 部分，去掉 buffer)
         pos_embed_hr_only = pos_embed[self.buffer_size:, :] 
         self.diffusion_pos_embed_learned.data.copy_(torch.from_numpy(pos_embed_hr_only).float().unsqueeze(0))
-        # initialize nn.Linear and nn.LayerNorm
+
+        # 3. 初始化通用层 (Linear, LayerNorm)
+        # 这会递归初始化包括 DiffLoss 在内的所有层
         self.apply(self._init_weights)
     def _init_weights(self, m):
         # 初始化全连接层和归一化层的bias和weight
