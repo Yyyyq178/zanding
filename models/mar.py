@@ -185,9 +185,9 @@ class MAR(nn.Module):
         #torch.nn.init.normal_(self.class_emb.weight, std=.02)
         #torch.nn.init.normal_(self.fake_latent, std=.02)
         torch.nn.init.normal_(self.mask_token, std=.02)
-        torch.nn.init.normal_(self.encoder_pos_embed_learned, std=.02)
-        torch.nn.init.normal_(self.decoder_pos_embed_learned, std=.02)
-        torch.nn.init.normal_(self.diffusion_pos_embed_learned, std=.02)
+        #torch.nn.init.normal_(self.encoder_pos_embed_learned, std=.02)
+        #torch.nn.init.normal_(self.decoder_pos_embed_learned, std=.02)
+        #torch.nn.init.normal_(self.diffusion_pos_embed_learned, std=.02)
         grid_size_hr = int(self.seq_len**0.5) 
         grid_size_lr = int(self.buffer_size**0.5)
 
