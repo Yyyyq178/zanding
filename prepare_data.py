@@ -10,13 +10,13 @@ import shutil
 zip_file_path = "/root/autodl-fs/hlwu/FFHQ512.zip"
 
 # 2. 解压目标根目录 (脚本会自动创建 HR_image 等子文件夹)
-target_root = "/root/autodl-tmp/zanding/dataset"
+target_root = "/root/autodl-tmp/zanding/data"
 
 # 3. 解压总数量
-limit_count = 6400
+limit_count = 70000
 
 # 4. 验证集比例 (0.1 表示 10% 做验证集)
-val_ratio = 0.01
+val_ratio = 0.1
 # ===========================================
 
 def setup_dir(path):

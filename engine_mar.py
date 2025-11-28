@@ -47,15 +47,23 @@ def train_one_epoch(model, vae,
 
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
+    
+    num_steps_per_epoch = len(data_loader)
+    if args.steps_per_epoch > 0 and args.steps_per_epoch < len(data_loader):
+        num_steps_per_epoch = args.steps_per_epoch
 
-    for data_iter_step, (samples_hr, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (samples_hr, samples_lr) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+
+        # 如果当前步数达到了我们设定的限制，直接强行结束这一轮，进入 Validation
+        if args.steps_per_epoch > 0 and data_iter_step >= args.steps_per_epoch:
+            break
 
         # we use a per iteration (instead of per epoch) lr scheduler
-        lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
+        lr_sched.adjust_learning_rate(optimizer, data_iter_step / num_steps_per_epoch + epoch, args)
 
         # 把数据移到 GPU
         samples_hr = samples_hr.to(device, non_blocking=True)
-        samples_lr = F.interpolate(samples_hr, size=(128, 128), mode='bicubic', align_corners=False)
+        samples_lr = samples_lr.to(device, non_blocking=True)
         #samples_lr = samples_lr.to(device, non_blocking=True)
 
         with torch.no_grad():
@@ -117,7 +125,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
     torch.cuda.empty_cache()
     model_without_ddp.eval()
     #num_steps = args.num_images // (batch_size * misc.get_world_size()) + 1
-    save_folder = os.path.join(args.output_dir, "ariter{}-diffsteps{}-temp{}-{}cfg{}-image{}".format(args.num_iter,
+    save_folder = os.path.join(args.output_dir, "ariter{}-diffsteps{}-temp{}-{}cfg{}-image_num{}".format(args.num_iter,
                                                                                                      args.num_sampling_steps,
                                                                                                      args.temperature,
                                                                                                      args.cfg_schedule,
@@ -197,21 +205,24 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
     print(f"Start evaluation on {len(data_loader)} batches...")
     
     # 开始遍历验证集 (HR, LR)
-    for i, (imgs_hr, _) in enumerate(data_loader):
+    for i, (imgs_hr, imgs_lr) in enumerate(data_loader):
         
         # 1. 准备数据
         imgs_hr = imgs_hr.cuda(non_blocking=True)
         #imgs_lr = imgs_lr.cuda(non_blocking=True)
-        imgs_lr = F.interpolate(imgs_hr, size=(128, 128), mode='bicubic', align_corners=False)
+        imgs_lr = imgs_lr.cuda(non_blocking=True)
         # 为了节省时间，只跑前 5 个 batch 看效果
-        # if i >= 5: 
-        #     print("Finished 5 batches preview, stopping evaluation.")
-        #     break 
-
+        if i >= 5: 
+            print("Finished 5 batches preview, stopping evaluation.")
+            break 
         # 2. 编码 LR (作为条件)
         with torch.no_grad():
             posterior_lr = vae.encode(imgs_lr)
             x_lr = posterior_lr.sample().mul_(0.2325) 
+
+        # with torch.no_grad():
+        #     posterior_hr = vae.encode(imgs_hr)
+        #     gt = posterior_hr.sample().mul_(0.2325) 
 
         # 3. 生成 (Inference)
         with torch.no_grad():

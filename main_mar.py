@@ -16,7 +16,7 @@ from util.crop import center_crop_arr
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from util.loader import CachedFolder
-
+from dataset_sr import SRDataset
 from models.vae import AutoencoderKL
 from models import mar
 from engine_mar import train_one_epoch, evaluate
@@ -48,7 +48,7 @@ def get_args_parser():
     # Generation parameters
     parser.add_argument('--num_iter', default=64, type=int,
                         help='number of autoregressive iterations to generate an image')
-    parser.add_argument('--num_images', default=50000, type=int,
+    parser.add_argument('--num_images', default=70000, type=int,
                         help='number of images to generate')
     parser.add_argument('--cfg', default=1.0, type=float, help="classifier-free guidance")
     parser.add_argument('--cfg_schedule', default="linear", type=str)
@@ -102,7 +102,8 @@ def get_args_parser():
     #                    help='dataset path for Low Resolution images')
     
     #parser.add_argument('--class_num', default=1000, type=int)
-
+    parser.add_argument('--steps_per_epoch', default=-1, type=int,
+                        help='max steps per epoch (force stop), -1 means run full epoch')
     parser.add_argument('--output_dir', default='./output_dir',
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default='./output_dir',
@@ -170,21 +171,42 @@ def main(args):
     #     transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
     # ])
     # augmentation following DiT and ADM
-    transform_train = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.img_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-    ])
-
+    # transform_train = transforms.Compose([
+    #     transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.img_size)),
+    #     transforms.RandomHorizontalFlip(),
+    #     transforms.ToTensor(),
+    #     transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+    # ])
     if args.use_cached:
-        dataset_train = CachedFolder(args.cached_path)
+        raise NotImplementedError("Cached mode needs update for SRDataset")
     else:
-        dataset_train = datasets.ImageFolder(
+        # 定义训练集: 开启随机裁剪 (is_train=True)
+        # hr_size=128, lr_size=32 (根据你的需求)
+        dataset_train = SRDataset(
             root=os.path.join(args.hr_data_path, 'train'),
-            transform=transform_train
+            hr_size=args.img_size,       # 128 (从命令行传入)
+            lr_size=args.img_size // 4,  # 32  (自动计算)
+            is_train=True
         )
+        
+        # 定义验证集: 关闭随机裁剪 (is_train=False)
+        dataset_val = SRDataset(
+            root=os.path.join(args.hr_data_path, 'val'),
+            hr_size=args.img_size,
+            lr_size=args.img_size // 4,
+            is_train=False
+        )
+
     print(dataset_train)
+
+    # if args.use_cached:
+    #     dataset_train = CachedFolder(args.cached_path)
+    # else:
+    #     dataset_train = datasets.ImageFolder(
+    #         root=os.path.join(args.hr_data_path, 'train'),
+    #         transform=transform_train
+    #     )
+    # print(dataset_train)
 
     sampler_train = torch.utils.data.DistributedSampler(
         dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
@@ -200,10 +222,10 @@ def main(args):
     )
 
     # --- 【新增】定义验证集加载器 ---
-    dataset_val = datasets.ImageFolder(
-        root=os.path.join(args.hr_data_path, 'val'),
-        transform=transform_train
-    )
+    # dataset_val = datasets.ImageFolder(
+    #     root=os.path.join(args.hr_data_path, 'val'),
+    #     transform=transform_train
+    # )
     # 验证集不需要打乱 (shuffle=False)，也不需要分布式采样 (除非多卡，单卡设None即可)
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val, sampler=None,
