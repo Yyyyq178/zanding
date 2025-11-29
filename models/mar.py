@@ -178,6 +178,10 @@ class MAR(nn.Module):
         )
         self.diffusion_batch_mul = diffusion_batch_mul
 
+        # 🟢【新增】最终预测头 (用于 MSE Loss)(需要删除)
+        # 把 Decoder 的 768 维特征映射回 16 维的 VAE Latent 空间
+        self.final_proj = nn.Linear(decoder_embed_dim, vae_embed_dim, bias=True)
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -347,13 +351,30 @@ class MAR(nn.Module):
         # z: Decoder 预测出的 Latent 特征 [Batch, Seq_Len, Dim]
         # target: 真实的 Latent 特征 (Ground Truth) [Batch, Seq_Len, Dim]
         # mask: 当前的遮挡掩码 [Batch, Seq_Len]  
-        bsz, seq_len, _ = target.shape
+
+        #bsz, seq_len, _ = target.shape#新注释的，需要还原
+
         # 每一张图片在一次 Forward 中同时学习 4 个不同的扩散时间步（diffusion_batch_mul）
-        target = target.reshape(bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)
-        z = z.reshape(bsz*seq_len, -1).repeat(self.diffusion_batch_mul, 1)
-        mask = mask.reshape(bsz*seq_len).repeat(self.diffusion_batch_mul)
+        #target = target.reshape(bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)#新注释的，需要还原
+        #z = z.reshape(bsz*seq_len, -1).repeat(self.diffusion_batch_mul, 1)#新注释的，需要还原
+        #mask = mask.reshape(bsz*seq_len).repeat(self.diffusion_batch_mul)#新注释的，需要还原
+
         # z 是条件 (Condition)，target 是要加噪的数据 (x_start)
-        loss = self.diffloss(z=z, target=target, mask=mask)
+        #loss = self.diffloss(z=z, target=target, mask=mask)#新注释的，需要还原
+
+        ### 下面是测试用的代码，需要删除
+        # MSE Loss 逻辑
+        # 计算每个元素的平方差: (Pred - GT)^2
+        z = self.final_proj(z)
+        loss = (z - target) ** 2 
+        
+        # 在特征维度(Dim)上取平均 -> [Batch, Seq_Len]
+        loss = loss.mean(dim=-1)
+        
+        # 只计算被遮挡部分(Mask=1)的 Loss
+        # sum() 是总误差，mask.sum() 是被遮挡的 Token 总数
+        # 加一个极小值 1e-6 防止除以 0
+        loss = (loss * mask).sum() / (mask.sum() + 1e-6)
         return loss
 
     def forward(self, x_hr, x_lr):
@@ -443,21 +464,25 @@ class MAR(nn.Module):
 
             # sample token latents for this step
             z = z[mask_to_pred.nonzero(as_tuple=True)]
-            # cfg schedule follow Muse
-            if cfg_schedule == "linear":
-                cfg_iter = 1 + (cfg - 1) * (self.seq_len - mask_len[0]) / self.seq_len
-            elif cfg_schedule == "constant":
-                cfg_iter = cfg
-            else:
-                raise NotImplementedError
-            sampled_token_latent = self.diffloss.sample(z, temperature, cfg_iter)
-            if not cfg == 1.0:
-                sampled_token_latent, _ = sampled_token_latent.chunk(2, dim=0)  # Remove null class samples
-                mask_to_pred, _ = mask_to_pred.chunk(2, dim=0)
+            ##469-479为测试时注释掉的部分，需要恢复，480,481需要删除
+
+            # # cfg schedule follow Muse
+            # if cfg_schedule == "linear":
+            #     cfg_iter = 1 + (cfg - 1) * (self.seq_len - mask_len[0]) / self.seq_len
+            # elif cfg_schedule == "constant":
+            #     cfg_iter = cfg
+            # else:
+            #     raise NotImplementedError
+            # sampled_token_latent = self.diffloss.sample(z, temperature, cfg_iter)
+            # if not cfg == 1.0:
+            #     sampled_token_latent, _ = sampled_token_latent.chunk(2, dim=0)  # Remove null class samples
+            #     mask_to_pred, _ = mask_to_pred.chunk(2, dim=0)
+            z = self.final_proj(z)
+            sampled_token_latent = z
 
             cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
             tokens = cur_tokens.clone()
-
+        
         # unpatchify
         tokens = self.unpatchify(tokens)
         return tokens

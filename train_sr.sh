@@ -20,15 +20,15 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --vae_stride 16 \
     --patch_size 1 \
     --cfg 1.0 \
-    --epochs 400 \
+    --epochs 800 \
     --warmup_epochs 5 \
     --batch_size 32 \
-    --grad_clip 3.0 \
-    --steps_per_epoch 1000 \
-    --blr 5.0e-3 \
+    --grad_clip 1.0 \
+    --steps_per_epoch 500 \
+    --blr 8.0e-3 \
     --hr_data_path /root/autodl-tmp/zanding/data/HR_image \
-    --output_dir output_sr_train \
-    --eval_freq 4 \
+    --output_dir output_sr_train_diffusionloss \
+    --eval_freq 2 \
     --save_last_freq 2 \
     --eval_bsz 8 \
     --img_size 128 \
