@@ -45,38 +45,43 @@ def get_2d_sincos_pos_embed_from_grid_torch(embed_dim, grid):
     emb = torch.cat([emb_h, emb_w], dim=1) # (H*W, D)
     return emb
 
-def get_2d_sincos_pos_embed_torch(embed_dim, grid_size_hr, grid_size_lr, device):
+def get_2d_sincos_pos_embed_torch(embed_dim, grid_size_hr, grid_size_lr, device, base_size=16):
     """
-    动态生成对齐的 2D 位置编码
-    grid_size_hr: int (例如 32)
-    grid_size_lr: int (例如 8)
-    """
-    # 1. 生成 HR 网格 (0, 1, ..., 31)
-    # 使用 torch.meshgrid
-    grid_h = torch.arange(grid_size_hr, dtype=torch.float, device=device)
-    grid_w = torch.arange(grid_size_hr, dtype=torch.float, device=device)
-    # indexing='xy' 保证 x在前 y在后 (W, H)，与 numpy 逻辑一致
-    grid_x, grid_y = torch.meshgrid(grid_w, grid_h, indexing='xy') 
+    生成 2D 绝对位置编码，支持任意分辨率归一化。
     
-    # 堆叠: 第0维是y(H), 第1维是x(W)
-    grid_hr = torch.stack([grid_y, grid_x], dim=0) # [2, 32, 32]
+    Args:
+        embed_dim: 输出维度
+        grid_size_hr: tuple (h_hr, w_hr) -> HR 特征图的 (高, 宽)
+        grid_size_lr: tuple (h_lr, w_lr) -> LR 特征图的 (高, 宽)
+        device: 设备
+        base_size: 归一化基准大小 (建议设为训练时 token 的默认边长，如 16)
+    """
+    h_hr, w_hr = grid_size_hr
+    h_lr, w_lr = grid_size_lr
+    
+    # === 核心修改：归一化坐标系 (参考 VARSR) ===
+    # 逻辑：(坐标 + 0.5) / 当前边长 * 基准边长
+    # 效果：无论分辨率由多大，都被映射到 [0, base_size] 的连续空间
+    
+    # 1. 生成 HR 网格 (Pixel Center Alignment)
+    grid_h = (torch.arange(h_hr, dtype=torch.float, device=device) + 0.5) / h_hr * base_size
+    grid_w = (torch.arange(w_hr, dtype=torch.float, device=device) + 0.5) / w_hr * base_size
+    grid_x, grid_y = torch.meshgrid(grid_w, grid_h, indexing='xy')
+    grid_hr = torch.stack([grid_y, grid_x], dim=0) # [2, H, W]
 
-    # 2. 生成 LR 网格 (对齐到 HR 空间)
-    # 使用 linspace 实现连续尺度对齐
-    # 无论 LR 是多少，它的坐标范围都被拉伸到 0 到 (grid_size_hr - 1)
-    start, end = 0, grid_size_hr - 1
-    grid_l_h = torch.linspace(start, end, steps=grid_size_lr, device=device)
-    grid_l_w = torch.linspace(start, end, steps=grid_size_lr, device=device)
+    # 2. 生成 LR 网格
+    # LR 网格在同一空间下的坐标。
+    # 只要 HR 和 LR 覆盖相同的物理视野（FOV），这种归一化就能保证它们空间对齐。
+    grid_l_h = (torch.arange(h_lr, dtype=torch.float, device=device) + 0.5) / h_lr * base_size
+    grid_l_w = (torch.arange(w_lr, dtype=torch.float, device=device) + 0.5) / w_lr * base_size
     grid_lx, grid_ly = torch.meshgrid(grid_l_w, grid_l_h, indexing='xy')
-    
-    grid_lr = torch.stack([grid_ly, grid_lx], dim=0) # [2, 8, 8]
+    grid_lr = torch.stack([grid_ly, grid_lx], dim=0) # [2, h_lr, w_lr]
 
-    # 3. 计算编码
+    # 3. 计算 Sin/Cos 编码 (调用原有函数)
     pos_embed_hr = get_2d_sincos_pos_embed_from_grid_torch(embed_dim, grid_hr)
     pos_embed_lr = get_2d_sincos_pos_embed_from_grid_torch(embed_dim, grid_lr)
 
-    # 4. 拼接 (Buffer 在前)
-    # [1, Total_Len, Dim]
+    # 4. 拼接 (Buffer/LR 在前)
     pos_embed = torch.cat([pos_embed_lr, pos_embed_hr], dim=0).unsqueeze(0)
     return pos_embed
 
@@ -252,7 +257,7 @@ class MAR(nn.Module):
                              src=torch.ones(bsz, seq_len, device=x.device))
         return mask
 
-    def forward_mae_encoder(self, x_hr, mask, x_lr):
+    def forward_mae_encoder(self, x_hr, mask, x_lr, shape_hr, shape_lr):
         # x: [Batch, Seq_Len=256, Dim=16] (VAE 输出的 token)
         # mask: [Batch, Seq_Len=256] (0=可见, 1=遮挡)
         # x_lr: LR tokens（来自VAE编码，维度 16）
@@ -264,21 +269,11 @@ class MAR(nn.Module):
         # x = torch.cat([torch.zeros(bsz, self.buffer_size, embed_dim, device=x.device), x], dim=1)
         x = torch.cat([lr_embedding, hr_embedding], dim=1)
 
-         # 3. 动态计算网格大小
-        # hr_embedding.shape[1] 是当前 HR 的 Token 数量 (例如 64 或 1024)
-        # lr_embedding.shape[1] 是当前 LR 的 Token 数量 (例如 4 或 16)
-        num_hr_tokens = hr_embedding.shape[1]
-        num_lr_tokens = lr_embedding.shape[1]
-        
-        # 开根号得到边长 (例如 sqrt(64)=8, sqrt(4)=2)
-        grid_size_hr = int(num_hr_tokens**0.5)
-        grid_size_lr = int(num_lr_tokens**0.5)
-
         # 4. 实时生成位置编码
         # 调用我们在第一步添加的 torch 版本函数
         # 注意传入 x.device，确保生成的编码在 GPU 上
         pos_embed = get_2d_sincos_pos_embed_torch(
-            embed_dim, grid_size_hr, grid_size_lr, x.device
+            embed_dim, shape_hr, shape_lr, x.device, base_size=self.seq_h
         )
         
         # 5. 加上位置编码
@@ -286,8 +281,10 @@ class MAR(nn.Module):
 
         # 给buffer打上0，表示永远可见
         #mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
-        mask_with_buffer = torch.cat([torch.zeros(x.size(0), num_lr_tokens, device=x.device), mask], dim=1)
+        #mask_with_buffer = torch.cat([torch.zeros(x.size(0), num_lr_tokens, device=x.device), mask], dim=1)
+        num_lr_tokens = shape_lr[0] * shape_lr[1]
 
+        mask_with_buffer = torch.cat([torch.zeros(x.size(0), num_lr_tokens, device=x.device), mask], dim=1)
         x = self.z_proj_ln(x)
 
         # dropping
@@ -305,13 +302,14 @@ class MAR(nn.Module):
 
         return x
 
-    def forward_mae_decoder(self, x, mask,grid_size_hr,grid_size_lr):
+    def forward_mae_decoder(self, x, mask, shape_hr, shape_lr):
         # x: Encoder 的输出 (只有可见部分 + Buffer)
         # mask: 原始的遮挡掩码
         x = self.decoder_embed(x)
 
-        # 计算 LR Token 数量 (替代 self.buffer_size)
-        num_lr_tokens = grid_size_lr ** 2
+        # 根据真实形状计算 LR Token 总数
+        num_lr_tokens = shape_lr[0] * shape_lr[1]
+
         # 重建带有 buffer 的完整 mask
         mask_with_buffer = torch.cat([torch.zeros(x.size(0), num_lr_tokens, device=x.device), mask], dim=1)
 
@@ -322,12 +320,15 @@ class MAR(nn.Module):
         # 把可见特征填回它原来的位置
         x_after_pad[(1 - mask_with_buffer).nonzero(as_tuple=True)] = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
 
-        # 实时生成: [1, Total_Len, Dim]
+        # 调用新的位置编码函数
+        # 1. 传入 shape_hr, shape_lr
+        # 2. 传入 base_size=self.seq_h 进行归一化
         pos_embed = get_2d_sincos_pos_embed_torch(
             self.decoder_embed.out_features, 
-            grid_size_hr, 
-            grid_size_lr, 
-            x.device
+            shape_hr, 
+            shape_lr, 
+            x.device,
+            base_size=self.seq_h
         )
         # decoder position embedding
         x = x_after_pad + pos_embed
@@ -374,6 +375,13 @@ class MAR(nn.Module):
         # class embed
         #class_embedding = self.class_emb(x_lr)
 
+        # 显式获取 Latent 的真实高宽
+        # 这就是支持长方形输入的关键：不再假设 H=W
+        _, _, h_hr, w_hr = x_hr.shape
+        _, _, h_lr, w_lr = x_lr.shape
+        shape_hr = (h_hr, w_hr)
+        shape_lr = (h_lr, w_lr)
+
         # patchify and mask (drop) tokens
         # 切片化
         lr_tokens = self.patchify(x_lr)
@@ -385,16 +393,9 @@ class MAR(nn.Module):
         mask = self.random_masking(hr_tokens, orders)
 
         # mae encoder
-        x = self.forward_mae_encoder(hr_tokens, mask, lr_tokens)
-
-        # 根据 Token 数量反推边长
-        num_hr_tokens = hr_tokens.shape[1]
-        num_lr_tokens = lr_tokens.shape[1]
-        grid_size_hr = int(num_hr_tokens**0.5)
-        grid_size_lr = int(num_lr_tokens**0.5)
-
+        x = self.forward_mae_encoder(hr_tokens, mask, lr_tokens, shape_hr, shape_lr)
         # mae decoder
-        z = self.forward_mae_decoder(x, mask, grid_size_hr, grid_size_lr)
+        z = self.forward_mae_decoder(x, mask, shape_hr, shape_lr)
 
         # diffloss
         loss = self.forward_loss(z=z, target=gt_latents, mask=mask)
@@ -406,22 +407,45 @@ class MAR(nn.Module):
         # 必须有 LR 输入
         if x_lr is None:
             raise ValueError("Super-Resolution requires LR input!")
-            
-        # 处理 LR Tokens
-        lr_tokens = self.patchify(x_lr)
-        num_lr_tokens = lr_tokens.shape[1]
-        grid_size_lr = int(num_lr_tokens**0.5)
         
-        # 动态确定 HR 尺寸
-        if target_seq_len is not None:
-            # 如果外部指定了目标大小（比如根据验证集HR大小），就用指定的
-            num_hr_tokens = target_seq_len
-        else:
-            # 如果没指定，默认 4 倍
-            num_hr_tokens = num_lr_tokens * 16 # (4*4=16)
-            
-        grid_size_hr = int(num_hr_tokens**0.5)
+        # 精确获取 LR 的形状
+        # x_lr 是 Latent，形状 [B, C, h, w]
+        _, _, h_lr, w_lr = x_lr.shape
+        shape_lr = (h_lr, w_lr)
+        
+        # 先展平 LR tokens
+        lr_tokens = self.patchify(x_lr)
 
+        # 智能推断 HR 形状 (支持长方形)
+        if target_seq_len is not None:
+            # 如果外部指定了目标 Token 总数 (通常用于验证集对齐)
+            # 我们假设 HR 应该保持 LR 的长宽比
+            # area_hr = target_seq_len
+            # area_lr = h_lr * w_lr
+            # scale = sqrt(area_hr / area_lr)
+            current_area = h_lr * w_lr
+            scale = (target_seq_len / current_area) ** 0.5
+            
+            h_hr = int(round(h_lr * scale))
+            w_hr = int(round(w_lr * scale))
+            
+            # 修正取整误差：如果乘积不等于 target_seq_len，优先调整长边或允许微小 mismatch
+            # (但在 Token 序列生成中，长度必须严格匹配，所以通常这里计算出的 h*w 应该等于 target_seq_len)
+            # 为了安全起见，如果算出来不对，我们强制使用开根号兜底（针对正方形情况），或者报错
+            if h_hr * w_hr != target_seq_len:
+                 # 回退策略：如果是正方形任务，直接开方
+                 if h_lr == w_lr:
+                     side = int(target_seq_len**0.5)
+                     h_hr, w_hr = side, side
+                 else:
+                     print(f"Warning: Target seq len {target_seq_len} does not match aspect ratio of LR {h_lr}x{w_lr}. Shape inference might be inaccurate.")
+        else:
+            # 默认逻辑：按照 MAR 的标准设定，Latent 边长放大 4 倍 (Area x16)
+            h_hr = h_lr * 4
+            w_hr = w_lr * 4
+
+        shape_hr = (h_hr, w_hr)
+        num_hr_tokens = h_hr * w_hr
         # init and sample generation orders
         # 初始化掩码：全为 1 (代表全图被遮挡/未知)
         mask = torch.ones(bsz, num_hr_tokens).cuda()
@@ -443,10 +467,10 @@ class MAR(nn.Module):
         for step in indices:
             cur_tokens = tokens.clone()
             # mae encoder
-            x = self.forward_mae_encoder(tokens, mask, lr_tokens)
-
+            x = self.forward_mae_encoder(tokens, mask, lr_tokens, shape_hr, shape_lr)
+            
             # mae decoder
-            z = self.forward_mae_decoder(x, mask, grid_size_hr, grid_size_lr)
+            z = self.forward_mae_decoder(x, mask, shape_hr, shape_lr)
 
             # mask ratio for the next round, following MaskGIT and MAGE.
             mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
