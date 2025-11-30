@@ -224,7 +224,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         # 3. 记录分数 (MetricLogger 会自动处理累加和平滑)
         metric_logger.update(psnr=batch_psnr.mean().item())
         metric_logger.update(ssim=batch_ssim.mean().item())
-        metric_logger.update(lpips=batch_lpips.item())
+        metric_logger.update(lpips=batch_lpips.mean().item())
         # 4. 保存图片 (调用辅助函数)
         if misc.get_rank() == 0: # 只在主进程保存
             save_comparison_images(sampled_images, imgs_hr, imgs_lr, save_folder, i)
@@ -244,19 +244,20 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
 
     # 将指标保存到 TXT 文件
     if misc.get_rank() == 0:
-        # 定义 txt 文件路径 (保存在本次评估的 save_folder 下)
         txt_path = os.path.join(save_folder, "metrics_results.txt")
         
-        with open(txt_path, "w") as f:
-            f.write(f"Evaluation Results (Epoch {epoch}):\n")
-            f.write("=" * 30 + "\n")
-            # 遍历 logger 中的所有指标写入
-            for name, meter in metric_logger.meters.items():
-                f.write(f"{name}: {meter.global_avg:.4f}\n")
-            f.write("=" * 30 + "\n")
-            f.write(f"Full stats: {metric_logger}\n")
+        with open(txt_path, "a") as f:
+            # 构造单行日志字符串
+            # str(metric_logger) 会自动生成 "psnr: X (X)  ssim: X (X) ..." 的格式
+            log_str = f"Epoch {epoch}: {metric_logger}"
             
-        print(f"✅ Metrics saved to: {txt_path}")
+            # 如果计算了 FID，把它拼接到行尾
+            # if 'fid_score' in locals() and fid_score > 0:
+            #     log_str += f"  fid: {fid_score:.4f}"
+            
+            f.write(log_str + "\n")
+            
+        print(f"✅ Metrics appended to: {txt_path}")
     
     # 2. 如果配置了 Tensorboard，写入验证集指标
     if log_writer is not None:
