@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 设置端口 (防止冲突)
-export MASTER_PORT=29500
+export MASTER_PORT=29501
 
 # 运行训练
 # 注意参数的对应关系：
@@ -21,19 +21,18 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --cfg 1.0 \
     --epochs 800 \
     --warmup_epochs 5 \
-    --batch_size 32 \
+    --batch_size 8 \
     --grad_clip 1.0 \
     --steps_per_epoch 250 \
     --blr 5.0e-3 \
     --hr_data_path /root/autodl-tmp/zanding/data \
     --val_data_path /root/autodl-tmp/zanding/data \
-    --output_dir output_sr_train_diffusionloss \
+    --output_dir output_sr_train_diffusionloss_codeformer \
     --eval_freq 2 \
     --save_last_freq 2 \
     --eval_bsz 8 \
     --img_size 256 \
     --buffer_size 4 \
-    --resume output_sr_train_diffusionloss \
     --online_eval
     #--resume output_sr_train_diffusionloss \
     

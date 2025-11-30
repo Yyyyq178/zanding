@@ -4,7 +4,6 @@ __pycache__/
 
 # 核心大文件 (必须忽略!)
 data/
-dataset/
 imagenet/
 pretrained_models/
 output_*/
