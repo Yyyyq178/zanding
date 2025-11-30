@@ -21,7 +21,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --cfg 1.0 \
     --epochs 800 \
     --warmup_epochs 5 \
-    --batch_size 16 \
+    --batch_size 32 \
     --grad_clip 1.0 \
     --steps_per_epoch 250 \
     --blr 5.0e-3 \
@@ -33,6 +33,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --eval_bsz 8 \
     --img_size 256 \
     --buffer_size 4 \
+    --resume output_sr_train_diffusionloss_codeformer \
     --online_eval
-    #--resume output_sr_train_diffusionloss \
+    #--resume output_sr_train_diffusionloss_codeformer \
     

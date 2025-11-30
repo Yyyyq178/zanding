@@ -81,9 +81,9 @@ def train_one_epoch(model, vae,
                 x_lr = posterior_lr.sample().mul_(0.2325)
 
         # forward
-        #with torch.amp.autocast('cuda'):
+        with torch.amp.autocast('cuda'):
             # 传入模型
-        loss = model(x_hr, x_lr)
+            loss = model(x_hr, x_lr)
 
         loss_value = loss.item()
 
@@ -156,11 +156,11 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         return
     
     # --- 初始化评价指标 (加载模型到 GPU) ---
-    print("Loading metrics models (PSNR/SSIM)...")
+    print("Loading metrics models (PSNR/SSIM/LPIPS)...")
     # 这里的 device='cuda' 假设你一定用 GPU。LPIPS 计算较慢，如果不关心可以注释掉。
     psnr_metric = pyiqa.create_metric('psnr', device='cuda')
     ssim_metric = pyiqa.create_metric('ssim', device='cuda')
-    # lpips_metric = pyiqa.create_metric('lpips', device='cuda') 
+    lpips_metric = pyiqa.create_metric('lpips', device='cuda') 
     
     # 使用 misc.MetricLogger 来自动管理所有 GPU 上的平均分计算
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -191,40 +191,40 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
 
         # 3. 生成 (Inference)
         with torch.no_grad():
-            #with torch.amp.autocast('cuda'):
-            # 调用 sample_tokens，传入 x_lr
-            sampled_tokens = model_without_ddp.sample_tokens(
-                bsz=imgs_lr.shape[0], 
-                num_iter=args.num_iter, 
-                cfg=cfg,
-                cfg_schedule=args.cfg_schedule, 
-                x_lr=x_lr,
-                temperature=args.temperature,
-                target_seq_len=target_seq_len  
-            )
+            with torch.amp.autocast('cuda'):
+                # 调用 sample_tokens，传入 x_lr
+                sampled_tokens = model_without_ddp.sample_tokens(
+                    bsz=imgs_lr.shape[0], 
+                    num_iter=args.num_iter, 
+                    cfg=cfg,
+                    cfg_schedule=args.cfg_schedule, 
+                    x_lr=x_lr,
+                    temperature=args.temperature,
+                    target_seq_len=target_seq_len  
+                )
             
-            # 解码生成的 Token 变回图片
-            sampled_images = vae.decode(sampled_tokens / 0.2325)
+                # 解码生成的 Token 变回图片
+                sampled_images = vae.decode(sampled_tokens / 0.2325)
 
         # 1. 数据预处理：将范围从 [-1, 1] 转换到 [0, 1]
         # 注意：pyiqa 期望输入是 [0, 1] 的 float32 Tensor
         sr_tensor = (sampled_images + 1) / 2
-        sr_tensor = sr_tensor.clamp(0, 1)  # 截断防止越界
+        sr_tensor = sr_tensor.clamp(0, 1).float()  # 截断防止越界
         
         hr_tensor = (imgs_hr + 1) / 2
-        hr_tensor = hr_tensor.clamp(0, 1)
+        hr_tensor = hr_tensor.clamp(0, 1).float()
 
         # 2. 计算当前 batch 的分数
         with torch.no_grad():
             # pyiqa 会返回这个 batch 的平均分 (scalar tensor)
             batch_psnr = psnr_metric(sr_tensor, hr_tensor)
             batch_ssim = ssim_metric(sr_tensor, hr_tensor)
-            # batch_lpips = lpips_metric(sr_tensor, hr_tensor)
+            batch_lpips = lpips_metric(sr_tensor, hr_tensor)
 
         # 3. 记录分数 (MetricLogger 会自动处理累加和平滑)
         metric_logger.update(psnr=batch_psnr.mean().item())
         metric_logger.update(ssim=batch_ssim.mean().item())
-        # metric_logger.update(lpips=batch_lpips.item())
+        metric_logger.update(lpips=batch_lpips.item())
         # 4. 保存图片 (调用辅助函数)
         if misc.get_rank() == 0: # 只在主进程保存
             save_comparison_images(sampled_images, imgs_hr, imgs_lr, save_folder, i)
@@ -265,7 +265,8 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
             log_writer.add_scalar('val/psnr', metric_logger.meters['psnr'].global_avg, epoch)
         if 'ssim' in metric_logger.meters:
             log_writer.add_scalar('val/ssim', metric_logger.meters['ssim'].global_avg, epoch)
-            
+        if 'lpips' in metric_logger.meters:    
+            log_writer.add_scalar('val/lpips', metric_logger.meters['lpips'].global_avg, epoch)
     # 返回统计结果，方便外部调用
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
