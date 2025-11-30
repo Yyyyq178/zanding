@@ -90,13 +90,15 @@ def get_args_parser():
     # Diffusion Loss params
     parser.add_argument('--diffloss_d', type=int, default=12)
     parser.add_argument('--diffloss_w', type=int, default=1536)
-    parser.add_argument('--num_sampling_steps', type=str, default="100")
+    parser.add_argument('--num_sampling_steps', type=str, default="ddim100")
     parser.add_argument('--diffusion_batch_mul', type=int, default=1)
     parser.add_argument('--temperature', default=1.0, type=float, help='diffusion loss sampling temperature')
 
     # Dataset parameters
-    parser.add_argument('--hr_data_path', default='./data/imagenet', type=str,
+    parser.add_argument('--hr_data_path', default=None, type=str,
                         help='dataset path for High Resolution images')
+    parser.add_argument('--val_data_path', default=None, type=str,
+                        help='dataset path for validation (optional). If None, use hr_data_path/val')
     # 添加 LR 数据路径参数 
     #parser.add_argument('--lr_data_path', default='', type=str,
     #                    help='dataset path for Low Resolution images')
@@ -183,15 +185,20 @@ def main(args):
         # 定义训练集: 开启随机裁剪 (is_train=True)
         # hr_size=128, lr_size=32 (根据你的需求)
         dataset_train = SRDataset(
-            root=os.path.join(args.hr_data_path, 'train'),
-            hr_size=args.img_size,       # 128 (从命令行传入)
-            lr_size=args.img_size // 4,  # 32  (自动计算)
-            is_train=True
-        )
-        
-        # 定义验证集: 关闭随机裁剪 (is_train=False)
+        root=args.hr_data_path, 
+        hr_size=args.img_size,
+        lr_size=args.img_size // 4,
+        is_train=True
+    )
+        # 定义验证集
+        if args.val_data_path is not None:
+            val_root = args.val_data_path
+        else:
+        # 如果没指定单独验证集，就直接用训练集路径 (全量评估)
+            val_root = args.hr_data_path 
+
         dataset_val = SRDataset(
-            root=os.path.join(args.hr_data_path, 'val'),
+            root=val_root,
             hr_size=args.img_size,
             lr_size=args.img_size // 4,
             is_train=False
@@ -275,7 +282,7 @@ def main(args):
     print("effective batch size: %d" % eff_batch_size)
 
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu],find_unused_parameters=True)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
 
     # no weight decay on bias, norm layers, and diffloss MLP
@@ -286,7 +293,7 @@ def main(args):
 
     # resume training
     if args.resume and os.path.exists(os.path.join(args.resume, "checkpoint-last.pth")):
-        checkpoint = torch.load(os.path.join(args.resume, "checkpoint-last.pth"), map_location='cpu')
+        checkpoint = torch.load(os.path.join(args.resume, "checkpoint-last.pth"), map_location='cpu', weights_only=False)
         model_without_ddp.load_state_dict(checkpoint['model'])
         model_params = list(model_without_ddp.parameters())
         ema_state_dict = checkpoint['model_ema']

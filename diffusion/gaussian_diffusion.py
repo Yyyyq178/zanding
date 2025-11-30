@@ -320,9 +320,22 @@ class GaussianDiffusion:
             pred_xstart = process_xstart(
                 self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
             )
+            # if denoised_fn is not None:
+            #     pred_xstart = denoised_fn(pred_xstart)
+            
+            # if clip_denoised:
+            #     # 像素空间的标准做法
+            #     pred_xstart = pred_xstart.clamp(-1, 1)
+            # else:
+            #     # 🟢【新增】Latent 空间的“安全阀”
+            #     # VAE Latent 是标准正态分布，绝大部分数值在 [-3, 3] 之间。
+            #     # 我们给一个宽裕的范围 [-6, 6] 防止数值爆炸，同时保留细节。
+            #     # 如果没有这一行，训练初期 pred_xstart 会飞到 10000+，导致 VB Loss 爆炸。
+            #     pred_xstart = pred_xstart.clamp(-6.0, 6.0)
         model_mean, _, _ = self.q_posterior_mean_variance(x_start=pred_xstart, x_t=x, t=t)
 
         assert model_mean.shape == model_log_variance.shape == pred_xstart.shape == x.shape
+
         return {
             "mean": model_mean,
             "variance": model_variance,
@@ -330,14 +343,46 @@ class GaussianDiffusion:
             "pred_xstart": pred_xstart,
             "extra": extra,
         }
-
+    #####
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape
-        return (
-            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
-            - _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
-        )
+        
+        # 1. 获取系数
+        # coeff1 = 1 / sqrt(alpha_bar_t)
+        coeff1 = _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape)
+        # coeff2 = sqrt(1/alpha_bar_t - 1)
+        coeff2 = _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+        
+        # 2. 计算预测的 x_start (Latent)
+        pred_xstart = coeff1 * x_t - coeff2 * eps
+        
+        # # 🟢【修改】修正索引方式
+        # # 仅在主进程且偶尔打印
+        # current_t = t[0].item()
+        # if (current_t % 20 == 0 or pred_xstart.abs().max() > 100) and (t[0] == t[-1]): # 简单确保是一个时间步
+        #     # 🟢 新代码 (正确)
+        #     # 无论 coeff1 是几维的，先拉直，再取第一个数
+        #     # 这样 [N, 1] 或者 [N, C, H, W] 都能通用
+        #     alpha_val = coeff1.flatten()[0].item()
+            
+        #     # 避免除以0
+        #     if alpha_val > 0:
+        #         alpha_bar = 1 / (alpha_val ** 2)
+        #     else:
+        #         alpha_bar = 0.0
 
+        #     print(f"\n🔍 [Step {current_t}] 诊断报告:")
+        #     print(f"   - alpha_bar_t (信号强度): {alpha_bar:.6f}")
+        #     print(f"   - 1/sqrt(alpha) (放大倍数): {alpha_val:.2f}")
+        #     print(f"   - eps (预测噪声) Range: [{eps.min():.2f}, {eps.max():.2f}]")
+        #     print(f"   - x_t (当前带噪) Range: [{x_t.min():.2f}, {x_t.max():.2f}]")
+        #     print(f"   - x_0 (预测原图) Range: [{pred_xstart.min():.2f}, {pred_xstart.max():.2f}]")
+            
+        #     if pred_xstart.abs().max() > 1000:
+        #         print("   ⚠️ 警告：x_0 数值已严重爆炸！")
+
+        return pred_xstart
+    ######
     def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
         return (
             _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - pred_xstart

@@ -15,66 +15,69 @@ from models.diffloss import DiffLoss
 
 
 
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+def get_1d_sincos_pos_embed_from_grid_torch(embed_dim, pos):
     """
-    embed_dim: 每个位置的编码维度
-    pos: 位置坐标列表 (M,)
-    out: (M, D)
+    pos: [N] tensor
     """
     assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega = torch.arange(embed_dim // 2, dtype=torch.float, device=pos.device)
     omega /= embed_dim / 2.
     omega = 1. / 10000**omega  # (D/2,)
 
-    pos = pos.reshape(-1)  # (M,)
-    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), 外积
+    pos = pos.reshape(-1)  # (N,)
+    out = torch.einsum('m,d->md', pos, omega)  # (N, D/2)
 
-    emb_sin = np.sin(out) # (M, D/2)
-    emb_cos = np.cos(out) # (M, D/2)
+    emb_sin = torch.sin(out)
+    emb_cos = torch.cos(out)
 
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    emb = torch.cat([emb_sin, emb_cos], dim=1)  # (N, D)
     return emb
 
-def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+def get_2d_sincos_pos_embed_from_grid_torch(embed_dim, grid):
+    """
+    grid: [2, H, W]
+    """
     assert embed_dim % 2 == 0
-    # 使用一半的维度编码 H，一半的维度编码 W
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
-    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
+    # 前一半维度编码 H (y轴)，后一半维度编码 W (x轴)
+    emb_h = get_1d_sincos_pos_embed_from_grid_torch(embed_dim // 2, grid[0].flatten())
+    emb_w = get_1d_sincos_pos_embed_from_grid_torch(embed_dim // 2, grid[1].flatten())
+    
+    emb = torch.cat([emb_h, emb_w], dim=1) # (H*W, D)
     return emb
 
-def get_2d_sincos_pos_embed(embed_dim, grid_size_hr, grid_size_lr):
+def get_2d_sincos_pos_embed_torch(embed_dim, grid_size_hr, grid_size_lr, device):
     """
-    为 HR 和 LR 生成对齐的 2D sin-cos 位置编码
-    grid_size_hr: int, 例如 32 (对应 512分辨率)
-    grid_size_lr: int, 例如 8  (对应 128分辨率)
+    动态生成对齐的 2D 位置编码
+    grid_size_hr: int (例如 32)
+    grid_size_lr: int (例如 8)
     """
-    # 1. 生成 HR 的坐标网格 (0 到 grid_size_hr)
-    grid_h = np.arange(grid_size_hr, dtype=np.float32)
-    grid_w = np.arange(grid_size_hr, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)  # w 在前
-    grid = np.stack(grid, axis=0)
-    grid = grid.reshape([2, 1, grid_size_hr, grid_size_hr])
+    # 1. 生成 HR 网格 (0, 1, ..., 31)
+    # 使用 torch.meshgrid
+    grid_h = torch.arange(grid_size_hr, dtype=torch.float, device=device)
+    grid_w = torch.arange(grid_size_hr, dtype=torch.float, device=device)
+    # indexing='xy' 保证 x在前 y在后 (W, H)，与 numpy 逻辑一致
+    grid_x, grid_y = torch.meshgrid(grid_w, grid_h, indexing='xy') 
     
-    # 生成 HR 的 Embedding
-    pos_embed_hr = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    # 堆叠: 第0维是y(H), 第1维是x(W)
+    grid_hr = torch.stack([grid_y, grid_x], dim=0) # [2, 32, 32]
+
+    # 2. 生成 LR 网格 (对齐到 HR 空间)
+    # 使用 linspace 实现连续尺度对齐
+    # 无论 LR 是多少，它的坐标范围都被拉伸到 0 到 (grid_size_hr - 1)
+    start, end = 0, grid_size_hr - 1
+    grid_l_h = torch.linspace(start, end, steps=grid_size_lr, device=device)
+    grid_l_w = torch.linspace(start, end, steps=grid_size_lr, device=device)
+    grid_lx, grid_ly = torch.meshgrid(grid_l_w, grid_l_h, indexing='xy')
     
-    # 2. 生成 LR 的坐标网格 (关键步骤！)
-    # 我们使用 linspace 将 LR 的坐标“拉伸”覆盖到和 HR 一样的空间范围
-    # 例如: LR 的 0~7 坐标会被映射到 HR 的 0~31 范围内
-    grid_l_h = np.linspace(0, grid_size_hr - 1, grid_size_lr, dtype=np.float32)
-    grid_l_w = np.linspace(0, grid_size_hr - 1, grid_size_lr, dtype=np.float32)
-    grid_l = np.meshgrid(grid_l_w, grid_l_h)
-    grid_l = np.stack(grid_l, axis=0)
-    grid_l = grid_l.reshape([2, 1, grid_size_lr, grid_size_lr])
-    
-    # 生成 LR 的 Embedding
-    pos_embed_lr = get_2d_sincos_pos_embed_from_grid(embed_dim, grid_l)
-    
-    # 3. 拼接: LR 在前 (Buffer), HR 在后
-    # 结果 shape: [seq_len + buffer_size, embed_dim]
-    pos_embed = np.concatenate([pos_embed_lr, pos_embed_hr], axis=0)
-    
+    grid_lr = torch.stack([grid_ly, grid_lx], dim=0) # [2, 8, 8]
+
+    # 3. 计算编码
+    pos_embed_hr = get_2d_sincos_pos_embed_from_grid_torch(embed_dim, grid_hr)
+    pos_embed_lr = get_2d_sincos_pos_embed_from_grid_torch(embed_dim, grid_lr)
+
+    # 4. 拼接 (Buffer 在前)
+    # [1, Total_Len, Dim]
+    pos_embed = torch.cat([pos_embed_lr, pos_embed_hr], dim=0).unsqueeze(0)
     return pos_embed
 
 def mask_by_order(mask_len, order, bsz, seq_len):
@@ -138,7 +141,7 @@ class MAR(nn.Module):
         # 缓冲区大小：定义前缀长度 (64)
         self.buffer_size = buffer_size
         # 位置编码：这是一个可学习的参数表，长度 = 序列长度(256) + 缓冲区长度(64) = 320，维度 = 1024
-        self.encoder_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, encoder_embed_dim))
+        #self.encoder_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, encoder_embed_dim))
 
         # Transformer Blocks：堆叠 16 层
         self.encoder_blocks = nn.ModuleList([
@@ -154,7 +157,7 @@ class MAR(nn.Module):
         # mask_token：这是一个特殊的向量，代表“未知”，所有被遮住的位置，都会填入这个向量
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
         # Decoder 位置编码
-        self.decoder_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, decoder_embed_dim))
+        #self.decoder_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, decoder_embed_dim))
 
         # Transformer Blocks：堆叠 16 层
         self.decoder_blocks = nn.ModuleList([
@@ -163,8 +166,8 @@ class MAR(nn.Module):
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
         # Diffusion 位置编码：这是给 DiffLoss 用的额外位置信息
-        self.diffusion_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len, decoder_embed_dim))
-
+        # self.diffusion_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len, decoder_embed_dim))
+        self.initialize_weights()
         # --------------------------------------------------------------------------
         # Diffusion Loss
         # 实例化 DiffLoss 模块，它是一个独立的子网络 (MLP 或 Transformer)
@@ -178,40 +181,19 @@ class MAR(nn.Module):
         )
         self.diffusion_batch_mul = diffusion_batch_mul
 
-        # 🟢【新增】最终预测头 (用于 MSE Loss)(需要删除)
-        # 把 Decoder 的 768 维特征映射回 16 维的 VAE Latent 空间
-        self.final_proj = nn.Linear(decoder_embed_dim, vae_embed_dim, bias=True)
-
-        self.initialize_weights()
+        
 
     def initialize_weights(self):
         # parameters
-        #torch.nn.init.normal_(self.class_emb.weight, std=.02)
-        #torch.nn.init.normal_(self.fake_latent, std=.02)
         torch.nn.init.normal_(self.mask_token, std=.02)
-        #torch.nn.init.normal_(self.encoder_pos_embed_learned, std=.02)
-        #torch.nn.init.normal_(self.decoder_pos_embed_learned, std=.02)
-        #torch.nn.init.normal_(self.diffusion_pos_embed_learned, std=.02)
-        grid_size_hr = int(self.seq_len**0.5) 
-        grid_size_lr = int(self.buffer_size**0.5)
-
-        pos_embed = get_2d_sincos_pos_embed(
-            self.encoder_pos_embed_learned.shape[-1], # embed_dim (e.g. 768 or 1024)
-            grid_size_hr, 
-            grid_size_lr
-        )
-        # 赋值给 Encoder 和 Decoder
-        # unsqueeze(0) 是为了增加 Batch 维度: [1, Total_Len, Dim]
-        self.encoder_pos_embed_learned.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-        self.decoder_pos_embed_learned.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-        # 赋值给 Diffusion (只取 HR 部分，去掉 buffer)
-        pos_embed_hr_only = pos_embed[self.buffer_size:, :] 
-        self.diffusion_pos_embed_learned.data.copy_(torch.from_numpy(pos_embed_hr_only).float().unsqueeze(0))
-
-        # 3. 初始化通用层 (Linear, LayerNorm)
-        # 这会递归初始化包括 DiffLoss 在内的所有层
+        
         self.apply(self._init_weights)
+
+        # if hasattr(self.diffloss, 'initialize_weights'):
+        #     print("Restoring DiffLoss Zero-Initialization...")
+        #     self.diffloss.initialize_weights()
+
+
     def _init_weights(self, m):
         # 初始化全连接层和归一化层的bias和weight
         if isinstance(m, nn.Linear):
@@ -241,7 +223,8 @@ class MAR(nn.Module):
         bsz = x.shape[0]
         p = self.patch_size
         c = self.vae_embed_dim
-        h_, w_ = self.seq_h, self.seq_w
+        num_tokens = x.shape[1]
+        h_ = w_ = int(num_tokens**0.5)
 
         x = x.reshape(bsz, h_, w_, c, p, p)
         x = torch.einsum('nhwcpq->nchpwq', x)
@@ -280,22 +263,31 @@ class MAR(nn.Module):
         # concat buffer
         # x = torch.cat([torch.zeros(bsz, self.buffer_size, embed_dim, device=x.device), x], dim=1)
         x = torch.cat([lr_embedding, hr_embedding], dim=1)
+
+         # 3. 动态计算网格大小
+        # hr_embedding.shape[1] 是当前 HR 的 Token 数量 (例如 64 或 1024)
+        # lr_embedding.shape[1] 是当前 LR 的 Token 数量 (例如 4 或 16)
+        num_hr_tokens = hr_embedding.shape[1]
+        num_lr_tokens = lr_embedding.shape[1]
+        
+        # 开根号得到边长 (例如 sqrt(64)=8, sqrt(4)=2)
+        grid_size_hr = int(num_hr_tokens**0.5)
+        grid_size_lr = int(num_lr_tokens**0.5)
+
+        # 4. 实时生成位置编码
+        # 调用我们在第一步添加的 torch 版本函数
+        # 注意传入 x.device，确保生成的编码在 GPU 上
+        pos_embed = get_2d_sincos_pos_embed_torch(
+            embed_dim, grid_size_hr, grid_size_lr, x.device
+        )
+        
+        # 5. 加上位置编码
+        x = x + pos_embed
+
         # 给buffer打上0，表示永远可见
-        mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
+        #mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
+        mask_with_buffer = torch.cat([torch.zeros(x.size(0), num_lr_tokens, device=x.device), mask], dim=1)
 
-        # 注入类别条件 (CFG 技巧)
-        #if self.training:
-            # 训练时有 10% 概率把类别 Embedding 替换成“假标签”(fake_latent)
-            #drop_latent_mask = torch.rand(bsz) < self.label_drop_prob
-            #drop_latent_mask = drop_latent_mask.unsqueeze(-1).cuda().to(x.dtype)
-            #class_embedding = drop_latent_mask * self.fake_latent + (1 - drop_latent_mask) * class_embedding
-
-        # 把类别向量填满那 64 个 buffer 空位（重点修改这一步）
-        #x[:, :self.buffer_size] = class_embedding.unsqueeze(1)
-
-        # encoder position embedding
-        # 这一步赋予了每个 token 空间位置信息
-        x = x + self.encoder_pos_embed_learned
         x = self.z_proj_ln(x)
 
         # dropping
@@ -313,12 +305,15 @@ class MAR(nn.Module):
 
         return x
 
-    def forward_mae_decoder(self, x, mask):
+    def forward_mae_decoder(self, x, mask,grid_size_hr,grid_size_lr):
         # x: Encoder 的输出 (只有可见部分 + Buffer)
         # mask: 原始的遮挡掩码
         x = self.decoder_embed(x)
+
+        # 计算 LR Token 数量 (替代 self.buffer_size)
+        num_lr_tokens = grid_size_lr ** 2
         # 重建带有 buffer 的完整 mask
-        mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
+        mask_with_buffer = torch.cat([torch.zeros(x.size(0), num_lr_tokens, device=x.device), mask], dim=1)
 
         # pad mask tokens（填补空缺）
         # 先造一个全是不可见的底板，形状是完整的[Batch, 320, dim]
@@ -327,8 +322,15 @@ class MAR(nn.Module):
         # 把可见特征填回它原来的位置
         x_after_pad[(1 - mask_with_buffer).nonzero(as_tuple=True)] = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
 
+        # 实时生成: [1, Total_Len, Dim]
+        pos_embed = get_2d_sincos_pos_embed_torch(
+            self.decoder_embed.out_features, 
+            grid_size_hr, 
+            grid_size_lr, 
+            x.device
+        )
         # decoder position embedding
-        x = x_after_pad + self.decoder_pos_embed_learned
+        x = x_after_pad + pos_embed
 
         # apply Transformer blocks
         # Decoder 处理的是完整的长序列 (320)
@@ -342,9 +344,11 @@ class MAR(nn.Module):
         x = self.decoder_norm(x)
 
         # 移除buffer
-        x = x[:, self.buffer_size:]
+        x = x[:, num_lr_tokens:]
         # 加上diffusion位置编码
-        x = x + self.diffusion_pos_embed_learned
+        pos_embed_hr_only = pos_embed[:, num_lr_tokens:, :]
+        x = x + pos_embed_hr_only
+        
         return x
 
     def forward_loss(self, z, target, mask):
@@ -352,29 +356,16 @@ class MAR(nn.Module):
         # target: 真实的 Latent 特征 (Ground Truth) [Batch, Seq_Len, Dim]
         # mask: 当前的遮挡掩码 [Batch, Seq_Len]  
 
-        #bsz, seq_len, _ = target.shape#新注释的，需要还原
+        bsz, seq_len, _ = target.shape#新注释的，需要还原
 
         # 每一张图片在一次 Forward 中同时学习 4 个不同的扩散时间步（diffusion_batch_mul）
-        #target = target.reshape(bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)#新注释的，需要还原
-        #z = z.reshape(bsz*seq_len, -1).repeat(self.diffusion_batch_mul, 1)#新注释的，需要还原
-        #mask = mask.reshape(bsz*seq_len).repeat(self.diffusion_batch_mul)#新注释的，需要还原
+        target = target.reshape(bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)#新注释的，需要还原
+        z = z.reshape(bsz*seq_len, -1).repeat(self.diffusion_batch_mul, 1)#新注释的，需要还原
+        mask = mask.reshape(bsz*seq_len).repeat(self.diffusion_batch_mul)#新注释的，需要还原
 
         # z 是条件 (Condition)，target 是要加噪的数据 (x_start)
-        #loss = self.diffloss(z=z, target=target, mask=mask)#新注释的，需要还原
+        loss = self.diffloss(z=z, target=target, mask=mask)#新注释的，需要还原
 
-        ### 下面是测试用的代码，需要删除
-        # MSE Loss 逻辑
-        # 计算每个元素的平方差: (Pred - GT)^2
-        z = self.final_proj(z)
-        loss = (z - target) ** 2 
-        
-        # 在特征维度(Dim)上取平均 -> [Batch, Seq_Len]
-        loss = loss.mean(dim=-1)
-        
-        # 只计算被遮挡部分(Mask=1)的 Loss
-        # sum() 是总误差，mask.sum() 是被遮挡的 Token 总数
-        # 加一个极小值 1e-6 防止除以 0
-        loss = (loss * mask).sum() / (mask.sum() + 1e-6)
         return loss
 
     def forward(self, x_hr, x_lr):
@@ -396,29 +387,54 @@ class MAR(nn.Module):
         # mae encoder
         x = self.forward_mae_encoder(hr_tokens, mask, lr_tokens)
 
+        # 根据 Token 数量反推边长
+        num_hr_tokens = hr_tokens.shape[1]
+        num_lr_tokens = lr_tokens.shape[1]
+        grid_size_hr = int(num_hr_tokens**0.5)
+        grid_size_lr = int(num_lr_tokens**0.5)
+
         # mae decoder
-        z = self.forward_mae_decoder(x, mask)
+        z = self.forward_mae_decoder(x, mask, grid_size_hr, grid_size_lr)
 
         # diffloss
         loss = self.forward_loss(z=z, target=gt_latents, mask=mask)
 
         return loss
 
-    def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", x_lr=None, temperature=1.0, progress=False):
+    def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", x_lr=None, temperature=1.0, progress=False, target_seq_len=None):
         #num_iter：自回归迭代次数（官方推荐设置256）
+        # 必须有 LR 输入
+        if x_lr is None:
+            raise ValueError("Super-Resolution requires LR input!")
+            
+        # 处理 LR Tokens
+        lr_tokens = self.patchify(x_lr)
+        num_lr_tokens = lr_tokens.shape[1]
+        grid_size_lr = int(num_lr_tokens**0.5)
+        
+        # 动态确定 HR 尺寸
+        if target_seq_len is not None:
+            # 如果外部指定了目标大小（比如根据验证集HR大小），就用指定的
+            num_hr_tokens = target_seq_len
+        else:
+            # 如果没指定，默认 4 倍
+            num_hr_tokens = num_lr_tokens * 16 # (4*4=16)
+            
+        grid_size_hr = int(num_hr_tokens**0.5)
+
         # init and sample generation orders
         # 初始化掩码：全为 1 (代表全图被遮挡/未知)
-        mask = torch.ones(bsz, self.seq_len).cuda()
+        mask = torch.ones(bsz, num_hr_tokens).cuda()
         # 初始化 Token：全为 0 (画布是黑的)
-        tokens = torch.zeros(bsz, self.seq_len, self.token_embed_dim).cuda()
+        tokens = torch.zeros(bsz, num_hr_tokens, self.token_embed_dim).cuda()
         # 生成随机顺序：决定先画哪儿，后画哪儿
-        orders = self.sample_orders(bsz)
-
-        # 如果推理时传入了 x_lr（Latent形式）,先把它变成tokens
-        if x_lr is not None:
-            lr_tokens = self.patchify(x_lr)
-        else:
-            raise ValueError("Super-Resolution requires LR input!")
+        #orders = self.sample_orders(bsz)
+        orders = []
+        for _ in range(bsz):
+            order = np.array(list(range(num_hr_tokens))) # 使用动态长度
+            np.random.shuffle(order)
+            orders.append(order)
+        orders = torch.Tensor(np.array(orders)).cuda().long()
 
         indices = list(range(num_iter))
         if progress:
@@ -426,34 +442,23 @@ class MAR(nn.Module):
         # generate latents
         for step in indices:
             cur_tokens = tokens.clone()
-
-            # class embedding and CFG
-            # 如果启用 CFG (cfg != 1.0)，我们需要构造“双倍 Batch”
-            #if x_lr is not None:
-            #    class_embedding = self.class_emb(x_lr)
-            #else:
-            #    class_embedding = self.fake_latent.repeat(bsz, 1)
-            #if not cfg == 1.0:
-            #    tokens = torch.cat([tokens, tokens], dim=0)
-            #    class_embedding = torch.cat([class_embedding, self.fake_latent.repeat(bsz, 1)], dim=0)
-            #    mask = torch.cat([mask, mask], dim=0)
-
             # mae encoder
             x = self.forward_mae_encoder(tokens, mask, lr_tokens)
 
             # mae decoder
-            z = self.forward_mae_decoder(x, mask)
+            z = self.forward_mae_decoder(x, mask, grid_size_hr, grid_size_lr)
 
             # mask ratio for the next round, following MaskGIT and MAGE.
             mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
-            mask_len = torch.Tensor([np.floor(self.seq_len * mask_ratio)]).cuda()
+            #mask_len = torch.Tensor([np.floor(self.seq_len * mask_ratio)]).cuda()
+            mask_len = torch.Tensor([np.floor(num_hr_tokens * mask_ratio)]).cuda()
 
             # masks out at least one for the next iteration
             mask_len = torch.maximum(torch.Tensor([1]).cuda(),
                                      torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len))
 
             # get masking for next iteration and locations to be predicted in this iteration
-            mask_next = mask_by_order(mask_len[0], orders, bsz, self.seq_len)
+            mask_next = mask_by_order(mask_len[0], orders, bsz, num_hr_tokens) 
             if step >= num_iter - 1:
                 mask_to_pred = mask[:bsz].bool()
             else:
@@ -466,19 +471,19 @@ class MAR(nn.Module):
             z = z[mask_to_pred.nonzero(as_tuple=True)]
             ##469-479为测试时注释掉的部分，需要恢复，480,481需要删除
 
-            # # cfg schedule follow Muse
-            # if cfg_schedule == "linear":
-            #     cfg_iter = 1 + (cfg - 1) * (self.seq_len - mask_len[0]) / self.seq_len
-            # elif cfg_schedule == "constant":
-            #     cfg_iter = cfg
-            # else:
-            #     raise NotImplementedError
-            # sampled_token_latent = self.diffloss.sample(z, temperature, cfg_iter)
-            # if not cfg == 1.0:
-            #     sampled_token_latent, _ = sampled_token_latent.chunk(2, dim=0)  # Remove null class samples
-            #     mask_to_pred, _ = mask_to_pred.chunk(2, dim=0)
-            z = self.final_proj(z)
-            sampled_token_latent = z
+            # cfg schedule follow Muse
+            if cfg_schedule == "linear":
+                cfg_iter = 1 + (cfg - 1) * (num_hr_tokens - mask_len[0]) / num_hr_tokens
+            elif cfg_schedule == "constant":
+                cfg_iter = cfg
+            else:
+                raise NotImplementedError
+            sampled_token_latent = self.diffloss.sample(z, temperature, cfg_iter)
+            if not cfg == 1.0:
+                sampled_token_latent, _ = sampled_token_latent.chunk(2, dim=0)  # Remove null class samples
+                mask_to_pred, _ = mask_to_pred.chunk(2, dim=0)
+            #z = self.final_proj(z)
+            #sampled_token_latent = z
 
             cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
             tokens = cur_tokens.clone()

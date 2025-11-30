@@ -1,4 +1,3 @@
-#实现了论文提出的 "Diffusion Loss"（扩散损失）
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
@@ -15,11 +14,12 @@ class DiffLoss(nn.Module):
         self.net = SimpleMLPAdaLN(
             in_channels=target_channels,
             model_channels=width,
-            out_channels=target_channels * 2,  # for vlb loss
+            out_channels=target_channels *2,  # for vlb loss
             z_channels=z_channels,
             num_res_blocks=depth,
             grad_checkpointing=grad_checkpointing
         )
+        #, predict_xstart=True
 
         self.train_diffusion = create_diffusion(timestep_respacing="", noise_schedule="cosine")
         self.gen_diffusion = create_diffusion(timestep_respacing=num_sampling_steps, noise_schedule="cosine")
@@ -50,6 +50,8 @@ class DiffLoss(nn.Module):
             temperature=temperature
         )
 
+        if torch.rand(1).item() < 0.05:
+            print(f"ℹ️ [DiffLoss Sample] 采样成功。Range: [{sampled_token_latent.min():.2f}, {sampled_token_latent.max():.2f}]")
         return sampled_token_latent
 
 

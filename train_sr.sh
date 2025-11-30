@@ -14,7 +14,6 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --diffloss_d 6 \
     --diffloss_w 1024 \
     --vae_path pretrained_models/vae/kl16.ckpt \
-    --img_size 512 \
     --buffer_size 64 \
     --vae_embed_dim 16 \
     --vae_stride 16 \
@@ -24,15 +23,17 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --warmup_epochs 5 \
     --batch_size 32 \
     --grad_clip 1.0 \
-    --steps_per_epoch 500 \
-    --blr 8.0e-3 \
-    --hr_data_path /root/autodl-tmp/zanding/data/HR_image \
+    --steps_per_epoch 250 \
+    --blr 5.0e-3 \
+    --hr_data_path /root/autodl-tmp/zanding/data \
+    --val_data_path /root/autodl-tmp/zanding/data \
     --output_dir output_sr_train_diffusionloss \
     --eval_freq 2 \
     --save_last_freq 2 \
     --eval_bsz 8 \
-    --img_size 128 \
+    --img_size 256 \
     --buffer_size 4 \
+    --resume output_sr_train_diffusionloss \
     --online_eval
-    #--resume output_sr_train \
+    #--resume output_sr_train_diffusionloss \
     
