@@ -21,7 +21,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --cfg 1.0 \
     --epochs 800 \
     --warmup_epochs 5 \
-    --batch_size 8 \
+    --batch_size 16 \
     --grad_clip 1.0 \
     --steps_per_epoch 250 \
     --blr 5.0e-3 \

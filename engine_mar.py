@@ -9,7 +9,8 @@ import util.misc as misc
 import util.lr_sched as lr_sched
 import torch.nn.functional as F
 from models.vae import DiagonalGaussianDistribution
-import torch_fidelity
+#import torch_fidelity
+import pyiqa
 import shutil
 import cv2
 import numpy as np
@@ -17,6 +18,7 @@ import os
 import copy
 import time
 
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 def update_ema(target_params, source_params, rate=0.99):
     """
@@ -52,7 +54,7 @@ def train_one_epoch(model, vae,
     if args.steps_per_epoch > 0 and args.steps_per_epoch < len(data_loader):
         num_steps_per_epoch = args.steps_per_epoch
 
-    for data_iter_step, (samples_hr, samples_lr) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (samples_hr, samples_lr, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
         # 如果当前步数达到了我们设定的限制，直接强行结束这一轮，进入 Validation
         if args.steps_per_epoch > 0 and data_iter_step >= args.steps_per_epoch:
@@ -132,10 +134,9 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
     if args.evaluate:
         save_folder = save_folder + "_evaluate"
     print("Save to:", save_folder)
-    if misc.get_rank() == 0:
-        if not os.path.exists(save_folder):
-            os.makedirs(save_folder)
 
+    if misc.get_rank() == 0:
+        os.makedirs(save_folder, exist_ok=True)
     # switch to ema params
     if use_ema:
         model_state_dict = copy.deepcopy(model_without_ddp.state_dict())
@@ -153,11 +154,22 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
     if data_loader is None:
         print("No data loader provided for evaluation, skipping.")
         return
+    
+    # --- 初始化评价指标 (加载模型到 GPU) ---
+    print("Loading metrics models (PSNR/SSIM)...")
+    # 这里的 device='cuda' 假设你一定用 GPU。LPIPS 计算较慢，如果不关心可以注释掉。
+    psnr_metric = pyiqa.create_metric('psnr', device='cuda')
+    ssim_metric = pyiqa.create_metric('ssim', device='cuda')
+    # lpips_metric = pyiqa.create_metric('lpips', device='cuda') 
+    
+    # 使用 misc.MetricLogger 来自动管理所有 GPU 上的平均分计算
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    # -------------------------------------------
 
     print(f"Start evaluation on {len(data_loader)} batches...")
     
     # 开始遍历验证集 (HR, LR)
-    for i, (imgs_hr, imgs_lr) in enumerate(data_loader):
+    for i, (imgs_hr, imgs_lr, filenames) in enumerate(data_loader):
         
         # 1. 准备数据
         imgs_hr = imgs_hr.cuda(non_blocking=True)
@@ -194,9 +206,29 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
             # 解码生成的 Token 变回图片
             sampled_images = vae.decode(sampled_tokens / 0.2325)
 
+        # 1. 数据预处理：将范围从 [-1, 1] 转换到 [0, 1]
+        # 注意：pyiqa 期望输入是 [0, 1] 的 float32 Tensor
+        sr_tensor = (sampled_images + 1) / 2
+        sr_tensor = sr_tensor.clamp(0, 1)  # 截断防止越界
+        
+        hr_tensor = (imgs_hr + 1) / 2
+        hr_tensor = hr_tensor.clamp(0, 1)
+
+        # 2. 计算当前 batch 的分数
+        with torch.no_grad():
+            # pyiqa 会返回这个 batch 的平均分 (scalar tensor)
+            batch_psnr = psnr_metric(sr_tensor, hr_tensor)
+            batch_ssim = ssim_metric(sr_tensor, hr_tensor)
+            # batch_lpips = lpips_metric(sr_tensor, hr_tensor)
+
+        # 3. 记录分数 (MetricLogger 会自动处理累加和平滑)
+        metric_logger.update(psnr=batch_psnr.mean().item())
+        metric_logger.update(ssim=batch_ssim.mean().item())
+        # metric_logger.update(lpips=batch_lpips.item())
         # 4. 保存图片 (调用辅助函数)
         if misc.get_rank() == 0: # 只在主进程保存
             save_comparison_images(sampled_images, imgs_hr, imgs_lr, save_folder, i)
+
     torch.distributed.barrier()
     time.sleep(10)
 
@@ -205,36 +237,37 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         print("Switch back from ema")
         model_without_ddp.load_state_dict(model_state_dict)
 
-    # compute FID and IS
-    # if log_writer is not None:
-    #     if args.img_size == 256:
-    #         input2 = None
-    #         fid_statistics_file = 'fid_stats/adm_in256_stats.npz'
-    #     else:
-    #         raise NotImplementedError
-    #     metrics_dict = torch_fidelity.calculate_metrics(
-    #         input1=save_folder,
-    #         input2=input2,
-    #         fid_statistics_file=fid_statistics_file,
-    #         cuda=True,
-    #         isc=True,
-    #         fid=True,
-    #         kid=False,
-    #         prc=False,
-    #         verbose=False,
-    #     )
-    #     fid = metrics_dict['frechet_inception_distance']
-    #     inception_score = metrics_dict['inception_score_mean']
-    #     postfix = ""
-    #     if use_ema:
-    #        postfix = postfix + "_ema"
-    #     if not cfg == 1.0:
-    #        postfix = postfix + "_cfg{}".format(cfg)
-    #     log_writer.add_scalar('fid{}'.format(postfix), fid, epoch)
-    #     log_writer.add_scalar('is{}'.format(postfix), inception_score, epoch)
-    #     print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
-    #     # remove temporal saving folder
-    #     shutil.rmtree(save_folder)
+    # 1. 同步所有显卡的统计数据 (这一步非常重要，否则你看到的只有主卡的分数)
+    metric_logger.synchronize_between_processes()
+    
+    print("Averaged Validation stats:", metric_logger)
+
+    # 将指标保存到 TXT 文件
+    if misc.get_rank() == 0:
+        # 定义 txt 文件路径 (保存在本次评估的 save_folder 下)
+        txt_path = os.path.join(save_folder, "metrics_results.txt")
+        
+        with open(txt_path, "w") as f:
+            f.write(f"Evaluation Results (Epoch {epoch}):\n")
+            f.write("=" * 30 + "\n")
+            # 遍历 logger 中的所有指标写入
+            for name, meter in metric_logger.meters.items():
+                f.write(f"{name}: {meter.global_avg:.4f}\n")
+            f.write("=" * 30 + "\n")
+            f.write(f"Full stats: {metric_logger}\n")
+            
+        print(f"✅ Metrics saved to: {txt_path}")
+    
+    # 2. 如果配置了 Tensorboard，写入验证集指标
+    if log_writer is not None:
+        # 注意：这里假设你在第二步中已经像 metric_logger.update(psnr=...) 那样添加了这些 key
+        if 'psnr' in metric_logger.meters:
+            log_writer.add_scalar('val/psnr', metric_logger.meters['psnr'].global_avg, epoch)
+        if 'ssim' in metric_logger.meters:
+            log_writer.add_scalar('val/ssim', metric_logger.meters['ssim'].global_avg, epoch)
+            
+    # 返回统计结果，方便外部调用
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
     torch.distributed.barrier()
     time.sleep(10)

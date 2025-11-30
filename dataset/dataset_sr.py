@@ -7,6 +7,7 @@ import random
 import numpy as np
 import cv2
 import math
+import os
 
 # 引入degradation.py 中的核心函数
 from dataset.degradation import (
@@ -107,7 +108,10 @@ class SRDataset(Dataset):
         hr_tensor = self.normalize(hr_tensor)
         lr_tensor = self.normalize(lr_tensor)
 
-        return hr_tensor, lr_tensor
+        path, _ = self.dataset.samples[index]
+        filename = os.path.basename(path)
+        
+        return hr_tensor, lr_tensor, filename 
 
     def __len__(self):
         return len(self.dataset)
