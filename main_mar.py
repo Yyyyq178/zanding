@@ -28,7 +28,8 @@ def get_args_parser():
     parser.add_argument('--batch_size', default=16, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * # gpus')
     parser.add_argument('--epochs', default=400, type=int)
-
+    parser.add_argument('--degradation', default='realesrgan', type=str, 
+                    help='Degradation type: codeformer or realesrgan')
     # Model parameters
     parser.add_argument('--model', default='mar_large', type=str, metavar='MODEL',
                         help='Name of model to train')
@@ -188,7 +189,8 @@ def main(args):
         root=args.hr_data_path, 
         hr_size=args.img_size,
         lr_size=args.img_size // 4,
-        is_train=True
+        is_train=True, 
+        degradation_type=args.degradation
     )
         # 定义验证集
         if args.val_data_path is not None:
