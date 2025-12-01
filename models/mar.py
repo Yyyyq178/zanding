@@ -223,24 +223,35 @@ class MAR(nn.Module):
         x = x.reshape(bsz, h_ * w_, c * p ** 2)
         return x  # [n, l, d]   输出形状: [Batch, Seq_Len=256, Dim=16]
 
-    def unpatchify(self, x):
-        # 反向重塑
+    def unpatchify(self, x, shape=None):
         bsz = x.shape[0]
         p = self.patch_size
         c = self.vae_embed_dim
-        num_tokens = x.shape[1]
-        h_ = w_ = int(num_tokens**0.5)
+        
+        # 优先使用传入的动态形状
+        if shape is not None:
+            h_, w_ = shape
+        else:
+            # 只有在没传 shape 时，才尝试去猜（回退到训练时的固定形状）
+            h_, w_ = self.seq_h, self.seq_w
+
+        # (可选) 校验一下是否匹配
+        # assert h_ * w_ == x.shape[1], f"Shape mismatch: tokens={x.shape[1]}, target={h_}x{w_}"
 
         x = x.reshape(bsz, h_, w_, c, p, p)
         x = torch.einsum('nhwcpq->nchpwq', x)
         x = x.reshape(bsz, c, h_ * p, w_ * p)
         return x  # [n, c, h, w]
 
-    def sample_orders(self, bsz):
+    def sample_orders(self, bsz, num_tokens):
         # generate a batch of random generation orders
+        # 如果没传，回退到默认长度
+        if num_tokens is None:
+            num_tokens = self.seq_len
+
         orders = []
         for _ in range(bsz):
-            order = np.array(list(range(self.seq_len)))
+            order = np.array(list(range(num_tokens)))
             np.random.shuffle(order)
             orders.append(order)
         orders = torch.Tensor(np.array(orders)).cuda().long()
@@ -386,10 +397,12 @@ class MAR(nn.Module):
         # 切片化
         lr_tokens = self.patchify(x_lr)
         hr_tokens = self.patchify(x_hr)
+        # 获取当前 batch 的真实 token 数量
+        num_tokens = hr_tokens.shape[1]
         # 备份groundtruth（gt_latents）
         gt_latents = hr_tokens.clone().detach()
         # 生成随机掩码
-        orders = self.sample_orders(bsz=hr_tokens.size(0))
+        orders = self.sample_orders(bsz=hr_tokens.size(0), num_tokens = num_tokens)
         mask = self.random_masking(hr_tokens, orders)
 
         # mae encoder
@@ -453,12 +466,15 @@ class MAR(nn.Module):
         tokens = torch.zeros(bsz, num_hr_tokens, self.token_embed_dim).cuda()
         # 生成随机顺序：决定先画哪儿，后画哪儿
         #orders = self.sample_orders(bsz)
-        orders = []
-        for _ in range(bsz):
-            order = np.array(list(range(num_hr_tokens))) # 使用动态长度
-            np.random.shuffle(order)
-            orders.append(order)
-        orders = torch.Tensor(np.array(orders)).cuda().long()
+
+        # 直接调用修改后的 sample_orders，不用手写循环了
+        orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
+        # orders = []
+        # for _ in range(bsz):
+        #     order = np.array(list(range(num_hr_tokens))) # 使用动态长度
+        #     np.random.shuffle(order)
+        #     orders.append(order)
+        #orders = torch.Tensor(np.array(orders)).cuda().long()
 
         indices = list(range(num_iter))
         if progress:
@@ -513,7 +529,7 @@ class MAR(nn.Module):
             tokens = cur_tokens.clone()
         
         # unpatchify
-        tokens = self.unpatchify(tokens)
+        tokens = self.unpatchify(tokens, shape=shape_hr)
         return tokens
 
 

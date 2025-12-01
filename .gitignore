@@ -19,3 +19,10 @@ output_*/
 # 压缩包
 *.zip
 *.tar.gz
+
+#测试文件
+test_continuous_demo.py
+test_multiscale.py
+prepare_data.py
+ttt/
+results_continuous/
