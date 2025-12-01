@@ -320,18 +320,6 @@ class GaussianDiffusion:
             pred_xstart = process_xstart(
                 self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
             )
-            # if denoised_fn is not None:
-            #     pred_xstart = denoised_fn(pred_xstart)
-            
-            # if clip_denoised:
-            #     # 像素空间的标准做法
-            #     pred_xstart = pred_xstart.clamp(-1, 1)
-            # else:
-            #     # 🟢【新增】Latent 空间的“安全阀”
-            #     # VAE Latent 是标准正态分布，绝大部分数值在 [-3, 3] 之间。
-            #     # 我们给一个宽裕的范围 [-6, 6] 防止数值爆炸，同时保留细节。
-            #     # 如果没有这一行，训练初期 pred_xstart 会飞到 10000+，导致 VB Loss 爆炸。
-            #     pred_xstart = pred_xstart.clamp(-6.0, 6.0)
         model_mean, _, _ = self.q_posterior_mean_variance(x_start=pred_xstart, x_t=x, t=t)
 
         assert model_mean.shape == model_log_variance.shape == pred_xstart.shape == x.shape

@@ -59,7 +59,7 @@ def get_2d_sincos_pos_embed_torch(embed_dim, grid_size_hr, grid_size_lr, device,
     h_hr, w_hr = grid_size_hr
     h_lr, w_lr = grid_size_lr
     
-    # === 核心修改：归一化坐标系 (参考 VARSR) ===
+    # === 归一化坐标系 ===
     # 逻辑：(坐标 + 0.5) / 当前边长 * 基准边长
     # 效果：无论分辨率由多大，都被映射到 [0, base_size] 的连续空间
     

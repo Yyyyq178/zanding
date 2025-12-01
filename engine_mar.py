@@ -18,7 +18,7 @@ import os
 import copy
 import time
 
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 def update_ema(target_params, source_params, rate=0.99):
     """
@@ -66,7 +66,6 @@ def train_one_epoch(model, vae,
         # 把数据移到 GPU
         samples_hr = samples_hr.to(device, non_blocking=True)
         samples_lr = samples_lr.to(device, non_blocking=True)
-        #samples_lr = samples_lr.to(device, non_blocking=True)
 
         with torch.no_grad():
             if args.use_cached:
