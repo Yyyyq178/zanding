@@ -67,6 +67,31 @@ def train_one_epoch(model, vae,
         samples_hr = samples_hr.to(device, non_blocking=True)
         samples_lr = samples_lr.to(device, non_blocking=True)
 
+        if args.multi_scale: 
+            # 生成一个 [128, 256] 之间的随机整数尺寸
+            target_h = np.random.randint(128, 257)
+            #target_w = np.random.randint(128, 257)
+            
+            # 为了配合 VAE，建议调整为 16 的倍数 (可选，但推荐)
+            target_h = (target_h // 16) * 16
+            #target_w = (target_w // 16) * 16
+
+            # 强制正方形训练：
+            target_w = target_h 
+
+            # 如果生成的尺寸不是 256 (原始尺寸)，则进行下采样
+            if samples_lr.shape[-1] != target_w:
+                samples_lr = F.interpolate(
+                    samples_lr, 
+                    size=(target_h, target_w), 
+                    mode='bilinear', 
+                    align_corners=False,
+                    antialias=True # 推荐开启抗锯齿，防止缩放伪影
+                )
+        # 每隔一定步数抽查一次
+        if data_iter_step % 100 == 0 and misc.get_rank() == 0:
+            print(f"[Check Multi-Scale] Step {data_iter_step}: LR Shape = {samples_lr.shape[-2]} x {samples_lr.shape[-1]}")
+        
         with torch.no_grad():
             if args.use_cached:
                  raise NotImplementedError("Cached mode not supported for SR yet.")

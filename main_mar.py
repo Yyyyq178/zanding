@@ -33,6 +33,8 @@ def get_args_parser():
     # Model parameters
     parser.add_argument('--model', default='mar_large', type=str, metavar='MODEL',
                         help='Name of model to train')
+    # 多尺度训练开关
+    parser.add_argument('--multi_scale', action='store_true', help='Enable continuous multi-scale training')
 
     # VAE parameters
     parser.add_argument('--img_size', default=512, type=int,
@@ -100,11 +102,6 @@ def get_args_parser():
                         help='dataset path for High Resolution images')
     parser.add_argument('--val_data_path', default=None, type=str,
                         help='dataset path for validation (optional). If None, use hr_data_path/val')
-    # 添加 LR 数据路径参数 
-    #parser.add_argument('--lr_data_path', default='', type=str,
-    #                    help='dataset path for Low Resolution images')
-    
-    #parser.add_argument('--class_num', default=1000, type=int)
     parser.add_argument('--steps_per_epoch', default=-1, type=int,
                         help='max steps per epoch (force stop), -1 means run full epoch')
     parser.add_argument('--output_dir', default='./output_dir',
@@ -188,7 +185,7 @@ def main(args):
         dataset_train = SRDataset(
         root=args.hr_data_path, 
         hr_size=args.img_size,
-        lr_size=args.img_size // 4,
+        lr_size=args.img_size // 2,
         is_train=True, 
         degradation_type=args.degradation
     )
