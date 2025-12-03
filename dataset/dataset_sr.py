@@ -38,13 +38,13 @@ class SRDataset(Dataset):
         # 1. CodeFormer 参数配置 (简单退化)
         # ============================================================
         if self.degradation_type == 'codeformer':
-            self.cf_blur_kernel_size = 21
+            self.cf_blur_kernel_size = 41
             self.cf_kernel_list = ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
-            self.cf_kernel_prob = [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
-            self.cf_blur_sigma = [0.2, 3]
+            self.cf_kernel_prob = [0.5, 0.5, 0.12, 0.03, 0.12, 0.03]
+            self.cf_blur_sigma = [0.1, 12]
             self.cf_downsample_range = [1, 12]
             self.cf_noise_range = [0, 15]
-            self.cf_jpeg_range = [30, 95]
+            self.cf_jpeg_range = [30, 100]
 
         # ============================================================
         # 2. Real-ESRGAN 参数配置 (高阶退化)
@@ -59,30 +59,31 @@ class SRDataset(Dataset):
             self.betag_range = [0.5, 4]
             self.betap_range = [1, 2]
             self.resize_prob = [0.2, 0.7, 0.1]
-            self.resize_range = [0.15, 1.5]
+            self.resize_range = [0.3, 1.5]
             self.gaussian_noise_prob = 0.5
-            self.noise_range = [1, 30]
-            self.poisson_scale_range = [0.05, 3]
+            self.noise_range = [1, 15]
+            self.poisson_scale_range = [0.05, 2]
             self.gray_noise_prob = 0.4
+            self.jpeg_range2 = [60, 95]
             
             # 第二阶段
             self.blur_kernel_size2 = 21
             self.kernel_list2 = ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
             self.kernel_prob2 = [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
             self.sinc_prob2 = 0.1
-            self.blur_sigma2 = [0.2, 1.5]
+            self.blur_sigma2 = [0.2, 3]
             self.betag_range2 = [0.5, 4]
             self.betap_range2 = [1, 2]
-            self.resize_prob2 = [0.2, 0.7, 0.1]
-            self.resize_range2 = [0.3, 1.2]
+            self.resize_prob2 = [0.3, 0.4, 0.3]
+            self.resize_range2 = [0.6, 1.2]
             self.gaussian_noise_prob2 = 0.5
-            self.noise_range2 = [1, 25]
-            self.poisson_scale_range2 = [0.05, 2.5]
+            self.noise_range2 = [1, 12]
+            self.poisson_scale_range2 = [0.05, 1.0]
             self.gray_noise_prob2 = 0.4
+            self.jpeg_range2 = [60, 100]
             
             # 最终处理
             self.final_sinc_prob = 0.8
-            self.jpeg_range2 = [30, 95]
             self.kernel_range = [2 * v + 1 for v in range(3, 11)]
         
         else:
@@ -111,14 +112,12 @@ class SRDataset(Dataset):
         img_hr_np = np.array(img_hr).astype(np.float32) / 255.0
         
         # 3. 生成 LR
-        if self.is_train:
-            if self.degradation_type == 'codeformer':
-                img_lq = self._getitem_codeformer(img_hr_np)
-            elif self.degradation_type == 'realesrgan':
-                img_lq = self._getitem_realesrgan(img_hr_np)
-        else:
-            # 验证集：简单下采样
-            img_lq = cv2.resize(img_hr_np, (self.lr_size, self.lr_size), interpolation=cv2.INTER_CUBIC)
+        
+        if self.degradation_type == 'codeformer':
+            img_lq = self._getitem_codeformer(img_hr_np)
+        elif self.degradation_type == 'realesrgan':
+            img_lq = self._getitem_realesrgan(img_hr_np)
+        
 
         # 4. 转 Tensor 并归一化 ([-1, 1])
         hr_tensor = torch.from_numpy(np.ascontiguousarray(img_hr_np.transpose(2, 0, 1))).float()

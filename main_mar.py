@@ -20,6 +20,7 @@ from dataset.dataset_sr import SRDataset
 from models.vae import AutoencoderKL
 from models import mar
 from engine_mar import train_one_epoch, evaluate
+from models.swinir import SwinIR
 import copy
 
 
@@ -28,7 +29,7 @@ def get_args_parser():
     parser.add_argument('--batch_size', default=16, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * # gpus')
     parser.add_argument('--epochs', default=400, type=int)
-    parser.add_argument('--degradation', default='realesrgan', type=str, 
+    parser.add_argument('--degradation', default='codeformer', type=str, 
                     help='Degradation type: codeformer or realesrgan')
     # Model parameters
     parser.add_argument('--model', default='mar_large', type=str, metavar='MODEL',
@@ -247,6 +248,49 @@ def main(args):
     for param in vae.parameters():
         param.requires_grad = False
 
+    # ================= 初始化 SwinIR =================
+    print("Initializing SwinIR for LR preprocessing...")
+    
+    # 初始化 SwinIR 模型结构
+    swinir_model = SwinIR(
+        img_size=64, 
+        patch_size=1, 
+        in_chans=3,
+        embed_dim=180, 
+        depths=[6, 6, 6, 6, 6, 6], 
+        num_heads=[6, 6, 6, 6, 6, 6],
+        window_size=8, 
+        mlp_ratio=2., 
+        sf=4,  # <--- 关键参数：必须与权重文件名的倍数一致 (x4)
+        img_range=1., 
+        upsampler='nearest+conv', 
+        resi_connection='1conv'
+    )
+
+    # 定义权重路径 (请确认这个路径下真的有文件)
+    swinir_path = "pretrained_models/swinir/003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth"
+    
+    if os.path.exists(swinir_path):
+        # 加载权重
+        pretrained_dict = torch.load(swinir_path)
+        # 处理不同权重文件的 key 命名差异
+        if 'params_ema' in pretrained_dict:
+            pretrained_dict = pretrained_dict['params_ema']
+        elif 'params' in pretrained_dict:
+            pretrained_dict = pretrained_dict['params']
+            
+        swinir_model.load_state_dict(pretrained_dict, strict=True)
+        print(f"SwinIR weights loaded from {swinir_path}")
+    else:
+        print(f"Warning: SwinIR weight not found at {swinir_path}. Using random init (NOT RECOMMENDED).")
+
+    # 移动到 GPU 并冻结参数 (不参与训练)
+    swinir_model.eval()
+    swinir_model.to(device)
+    for param in swinir_model.parameters():
+        param.requires_grad = False
+    # ===========================================================
+    
     model = mar.__dict__[args.model](
         img_size=args.img_size,
         vae_stride=args.vae_stride,
@@ -334,7 +378,8 @@ def main(args):
             data_loader_train,
             optimizer, device, epoch, loss_scaler,
             log_writer=log_writer,
-            args=args
+            args=args, 
+            swinir_model=swinir_model
         )
 
         # save checkpoint
@@ -346,7 +391,7 @@ def main(args):
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
             evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=args.eval_bsz, log_writer=log_writer,
-                     cfg=1.0, use_ema=True, data_loader=data_loader_val)
+                     cfg=1.0, use_ema=True, data_loader=data_loader_val, swinir_model=swinir_model)
             if not (args.cfg == 1.0 or args.cfg == 0.0):
                 evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=args.eval_bsz // 2,
                          log_writer=log_writer, cfg=args.cfg, use_ema=True)

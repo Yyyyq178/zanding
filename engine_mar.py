@@ -38,6 +38,7 @@ def train_one_epoch(model, vae,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler,
                     log_writer=None,
+                    swinir_model=None,
                     args=None):
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -88,10 +89,33 @@ def train_one_epoch(model, vae,
                     align_corners=False,
                     antialias=True # 推荐开启抗锯齿，防止缩放伪影
                 )
-        # 每隔一定步数抽查一次
-        if data_iter_step % 100 == 0 and misc.get_rank() == 0:
-            print(f"[Check Multi-Scale] Step {data_iter_step}: LR Shape = {samples_lr.shape[-2]} x {samples_lr.shape[-1]}")
-        
+
+        # ================= SwinIR 预处理 =================
+        if swinir_model is not None:
+            with torch.no_grad():
+                # 范围转换 [-1, 1] -> [0, 1]
+                lr_input = (samples_lr + 1) / 2
+                
+                # SwinIR 推理
+                # 注意：如果 SwinIR 是 x4 模型，输出尺寸会变大 4 倍
+                lr_cleaned = swinir_model(lr_input)
+                
+                # 尺寸控制
+                if lr_cleaned.shape[-1] != samples_lr.shape[-1]:
+                    lr_cleaned = F.interpolate(
+                        lr_cleaned, 
+                        size=samples_lr.shape[-2:], 
+                        mode='bicubic', 
+                        align_corners=False
+                    )
+                
+                # 范围转换回 [-1, 1] 给 VAE
+                samples_lr = (lr_cleaned * 2) - 1
+                
+                # 显存清理
+                del lr_input, lr_cleaned
+        # ===========================================================
+
         with torch.no_grad():
             if args.use_cached:
                  raise NotImplementedError("Cached mode not supported for SR yet.")
@@ -143,7 +167,7 @@ def train_one_epoch(model, vae,
 
 
 def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log_writer=None, cfg=1.0,
-             use_ema=True, data_loader=None):
+             use_ema=True, data_loader=None, swinir_model=None):
     torch.cuda.empty_cache()
     model_without_ddp.eval()
     #num_steps = args.num_images // (batch_size * misc.get_world_size()) + 1
@@ -203,6 +227,14 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         if i >= 5: 
             print("Finished 5 batches preview, stopping evaluation.")
             break 
+        # SwinIR 预处理
+        if swinir_model is not None:
+            with torch.no_grad():
+                lr_input = (imgs_lr + 1) / 2
+                lr_cleaned = swinir_model(lr_input)
+                if lr_cleaned.shape[-1] != imgs_lr.shape[-1]:
+                    lr_cleaned = F.interpolate(lr_cleaned, size=imgs_lr.shape[-2:], mode='bicubic', align_corners=False)
+                imgs_lr = (lr_cleaned * 2) - 1
         # 2. 编码 LR (作为条件)
         with torch.no_grad():
             posterior_lr = vae.encode(imgs_lr)
