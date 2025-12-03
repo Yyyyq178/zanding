@@ -281,7 +281,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
             
             f.write(log_str + "\n")
             
-        print(f"✅ Metrics appended to: {txt_path}")
+        print(f"Metrics appended to: {txt_path}")
     
     # 2. 如果配置了 Tensorboard，写入验证集指标
     if log_writer is not None:
@@ -329,9 +329,9 @@ def cache_latents(vae,
 def save_comparison_images(sr, hr, lr, save_folder, batch_idx):
     # 辅助函数：把 Tensor 转为 numpy 图片
     def process(x):
-        # --- 🟢【新增】第一步：诊断是否炸了 ---
+        # --- 第一步：诊断是否炸了 ---
         if torch.isnan(x).any() or torch.isinf(x).any():
-            print(f"\n⚠️ 警告：在生成结果中检测到 NaN 或 Inf！(Batch {batch_idx})")
+            print(f"\n！警告：在生成结果中检测到 NaN 或 Inf！(Batch {batch_idx})")
             print(f"    统计: Min={x.min().item():.4f}, Max={x.max().item():.4f}, Mean={x.mean().item():.4f}")
             print("    -> 这说明模型训练不稳定（学习率太大），建议降低 blr。")
         

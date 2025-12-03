@@ -96,6 +96,8 @@ def get_args_parser():
     parser.add_argument('--num_sampling_steps', type=str, default="ddim100")
     parser.add_argument('--diffusion_batch_mul', type=int, default=1)
     parser.add_argument('--temperature', default=1.0, type=float, help='diffusion loss sampling temperature')
+    # MSE 损失权重，默认为 1.0 (你可以根据效果调整，如 0.5 或 0.1)
+    parser.add_argument('--mse_weight', default=0.2, type=float, help='Weight for MSE loss')
 
     # Dataset parameters
     parser.add_argument('--hr_data_path', default=None, type=str,
@@ -261,6 +263,7 @@ def main(args):
         num_sampling_steps=args.num_sampling_steps,
         diffusion_batch_mul=args.diffusion_batch_mul,
         grad_checkpointing=args.grad_checkpointing,
+        mse_weight=args.mse_weight,
     )
 
     print("Model = %s" % str(model))

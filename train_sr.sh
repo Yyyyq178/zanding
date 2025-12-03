@@ -27,12 +27,12 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --blr 1.0e-2 \
     --hr_data_path /root/autodl-tmp/zanding/data \
     --val_data_path /root/autodl-tmp/zanding/data \
-    --output_dir output_sr_train_diffusionloss_codeformer_512 \
+    --output_dir output_sr_train_diffusionloss_codeformer_256 \
     --degradation codeformer \
     --eval_freq 2 \
     --save_last_freq 2 \
     --eval_bsz 8 \
-    --img_size 512 \
+    --img_size 256 \
     --multi_scale \
     --lr_schedule cosine \
     --online_eval

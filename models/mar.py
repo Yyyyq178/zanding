@@ -110,6 +110,7 @@ class MAR(nn.Module):
                  num_sampling_steps='100',
                  diffusion_batch_mul=1,         #单卡最好设为1，之前为4
                  grad_checkpointing=False,
+                 mse_weight=0.2,
                  ):
         super().__init__()
 
@@ -124,6 +125,7 @@ class MAR(nn.Module):
         self.seq_len = self.seq_h * self.seq_w
         self.token_embed_dim = vae_embed_dim * patch_size**2
         self.grad_checkpointing = grad_checkpointing
+        self.mse_weight = mse_weight
 
         # --------------------------------------------------------------------------
         # Class Embedding
@@ -143,6 +145,8 @@ class MAR(nn.Module):
         # 投影层：把 VAE 的 16 维向量映射到 Transformer 的 1024 维
         self.z_proj = nn.Linear(self.token_embed_dim, encoder_embed_dim, bias=True)
         self.z_proj_ln = nn.LayerNorm(encoder_embed_dim, eps=1e-6)
+        #投影层：将 Decoder 维度 (768) 映射到 Token 维度 (16)
+        self.final_proj = nn.Linear(decoder_embed_dim, self.token_embed_dim)
         # 缓冲区大小：定义前缀长度 (64)
         self.buffer_size = buffer_size
         # 位置编码：这是一个可学习的参数表，长度 = 序列长度(256) + 缓冲区长度(64) = 320，维度 = 1024
@@ -193,10 +197,11 @@ class MAR(nn.Module):
         torch.nn.init.normal_(self.mask_token, std=.02)
         
         self.apply(self._init_weights)
+        #初始化投影层
+        torch.nn.init.xavier_uniform_(self.final_proj.weight)
+        if self.final_proj.bias is not None:
+            torch.nn.init.constant_(self.final_proj.bias, 0)
 
-        # if hasattr(self.diffloss, 'initialize_weights'):
-        #     print("Restoring DiffLoss Zero-Initialization...")
-        #     self.diffloss.initialize_weights()
 
 
     def _init_weights(self, m):
@@ -367,17 +372,26 @@ class MAR(nn.Module):
         # z: Decoder 预测出的 Latent 特征 [Batch, Seq_Len, Dim]
         # target: 真实的 Latent 特征 (Ground Truth) [Batch, Seq_Len, Dim]
         # mask: 当前的遮挡掩码 [Batch, Seq_Len]  
+        z_projected = self.final_proj(z)
+        loss_mse_element = (z_projected - target) ** 2
 
-        bsz, seq_len, _ = target.shape#新注释的，需要还原
+        loss_mse_token = loss_mse_element.mean(dim=-1)
+
+        loss_mse = (loss_mse_token * mask).sum() / (mask.sum() + 1e-6)
+
+        bsz, seq_len, _ = target.shape
 
         # 每一张图片在一次 Forward 中同时学习 4 个不同的扩散时间步（diffusion_batch_mul）
-        target = target.reshape(bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)#新注释的，需要还原
-        z = z.reshape(bsz*seq_len, -1).repeat(self.diffusion_batch_mul, 1)#新注释的，需要还原
-        mask = mask.reshape(bsz*seq_len).repeat(self.diffusion_batch_mul)#新注释的，需要还原
+        target_diff = target.reshape(bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)#新注释的，需要还原
+        z_diff = z.reshape(bsz*seq_len, -1).repeat(self.diffusion_batch_mul, 1)#新注释的，需要还原
+        mask_diff = mask.reshape(bsz*seq_len).repeat(self.diffusion_batch_mul)#新注释的，需要还原
+
 
         # z 是条件 (Condition)，target 是要加噪的数据 (x_start)
-        loss = self.diffloss(z=z, target=target, mask=mask)#新注释的，需要还原
+        loss_diff = self.diffloss(z=z_diff, target=target_diff, mask=mask_diff)#新注释的，需要还原
 
+        loss = loss_diff + self.mse_weight * loss_mse
+        
         return loss
 
     def forward(self, x_hr, x_lr):

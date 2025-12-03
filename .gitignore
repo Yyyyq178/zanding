@@ -26,3 +26,5 @@ test_multiscale.py
 prepare_data.py
 ttt/
 results_continuous/
+test_lr_images/
+results_continuous_1/
