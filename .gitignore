@@ -10,6 +10,7 @@ output_*/
 *.pth
 *.ckpt
 *.safetensors
+images_codeformer_swinir/
 
 # 系统/IDE配置
 .vscode/
@@ -28,3 +29,5 @@ ttt/
 results_continuous/
 test_lr_images/
 results_continuous_1/
+preprocess_swinir.py
+dataset_paired.py

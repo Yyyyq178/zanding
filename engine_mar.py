@@ -69,51 +69,51 @@ def train_one_epoch(model, vae,
         samples_lr = samples_lr.to(device, non_blocking=True)
 
         if args.multi_scale: 
-            # 生成一个 [128, 256] 之间的随机整数尺寸
-            target_h = np.random.randint(128, 257)
-            #target_w = np.random.randint(128, 257)
+            # 生成一个 [64, 128] 之间的随机整数尺寸
+            target_lr_size = np.random.randint(64, 129)
+            #target_w = np.random.randint(64, 129)
             
             # 为了配合 VAE，建议调整为 16 的倍数 (可选，但推荐)
-            target_h = (target_h // 16) * 16
+            #target_h = (target_h // 16) * 16
             #target_w = (target_w // 16) * 16
 
             # 强制正方形训练：
-            target_w = target_h 
+            #target_w = target_h 
 
-            # 如果生成的尺寸不是 256 (原始尺寸)，则进行下采样
-            if samples_lr.shape[-1] != target_w:
-                samples_lr = F.interpolate(
-                    samples_lr, 
-                    size=(target_h, target_w), 
-                    mode='bilinear', 
-                    align_corners=False,
-                    antialias=True # 推荐开启抗锯齿，防止缩放伪影
-                )
+            # 如果生成的尺寸不是 256 (原始尺寸)，则进行下采样        
+            samples_lr_input = F.interpolate(
+                samples_lr, 
+                size=(target_lr_size, target_lr_size), 
+                mode='bilinear', 
+                align_corners=False,
+                antialias=True # 推荐开启抗锯齿，防止缩放伪影
+            )
 
         # ================= SwinIR 预处理 =================
         if swinir_model is not None:
             with torch.no_grad():
                 # 范围转换 [-1, 1] -> [0, 1]
-                lr_input = (samples_lr + 1) / 2
+                lr_input = (samples_lr_input + 1) / 2
                 
                 # SwinIR 推理
                 # 注意：如果 SwinIR 是 x4 模型，输出尺寸会变大 4 倍
                 lr_cleaned = swinir_model(lr_input)
                 
                 # 尺寸控制
-                if lr_cleaned.shape[-1] != samples_lr.shape[-1]:
+                if lr_cleaned.shape[-1] != samples_hr.shape[-1]:
                     lr_cleaned = F.interpolate(
                         lr_cleaned, 
-                        size=samples_lr.shape[-2:], 
+                        size=samples_hr.shape[-2:], 
                         mode='bicubic', 
-                        align_corners=False
+                        align_corners=False,
+                        antialias=True
                     )
                 
                 # 范围转换回 [-1, 1] 给 VAE
                 samples_lr = (lr_cleaned * 2) - 1
                 
                 # 显存清理
-                del lr_input, lr_cleaned
+                del lr_input, lr_cleaned, samples_lr_input
         # ===========================================================
 
         with torch.no_grad():
@@ -142,7 +142,7 @@ def train_one_epoch(model, vae,
         loss_scaler(loss, optimizer, clip_grad=args.grad_clip, parameters=model.parameters(), update_grad=True)
         optimizer.zero_grad()
 
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize()
 
         update_ema(ema_params, model_params, rate=args.ema_rate)
 
@@ -227,14 +227,40 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         if i >= 5: 
             print("Finished 5 batches preview, stopping evaluation.")
             break 
+
+        # 线性均匀分布 (推荐，覆盖全面且稳定)
+        # 将 batch_index 映射到 [64, 128] 区间
+        # 例如：第1个batch测64，第2个测65... 循环往复
+        offset = i % (128 - 64 + 1) # 范围 0 ~ 64
+        target_eval_size = 64 + offset
+        
+        # 如果想要完全随机（和训练一模一样，但指标会抖动）
+        # target_eval_size = np.random.randint(64, 129)
+
+        # 手动下采样模拟多尺度输入
+        imgs_lr_input = F.interpolate(
+            imgs_lr, 
+            size=(target_eval_size, target_eval_size), 
+            mode='bicubic', 
+            antialias=True
+        )
+
         # SwinIR 预处理
         if swinir_model is not None:
             with torch.no_grad():
-                lr_input = (imgs_lr + 1) / 2
+                lr_input = (imgs_lr_input + 1) / 2
                 lr_cleaned = swinir_model(lr_input)
-                if lr_cleaned.shape[-1] != imgs_lr.shape[-1]:
-                    lr_cleaned = F.interpolate(lr_cleaned, size=imgs_lr.shape[-2:], mode='bicubic', align_corners=False)
+                # 强制对齐回 HR 尺寸 (256)
+                if lr_cleaned.shape[-1] != imgs_hr.shape[-1]:
+                    lr_cleaned = F.interpolate(
+                        lr_cleaned, 
+                        size=imgs_hr.shape[-2:], 
+                        mode='bicubic', 
+                        align_corners=False,
+                        antialias=True # 验证时建议开启抗锯齿，保证质量
+                    )
                 imgs_lr = (lr_cleaned * 2) - 1
+                del lr_input, lr_cleaned, imgs_lr_input
         # 2. 编码 LR (作为条件)
         with torch.no_grad():
             posterior_lr = vae.encode(imgs_lr)
@@ -286,7 +312,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
             save_comparison_images(sampled_images, imgs_hr, imgs_lr, save_folder, i)
 
     torch.distributed.barrier()
-    time.sleep(10)
+    time.sleep(1)
 
     # back to no ema
     if use_ema:
@@ -327,8 +353,8 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
     # 返回统计结果，方便外部调用
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
-    torch.distributed.barrier()
-    time.sleep(10)
+    #torch.distributed.barrier()
+    time.sleep(1)
 
 
 def cache_latents(vae,

@@ -202,7 +202,7 @@ def main(args):
         dataset_val = SRDataset(
             root=val_root,
             hr_size=args.img_size,
-            lr_size=args.img_size // 4,
+            lr_size=args.img_size // 2,
             is_train=False
         )
 
