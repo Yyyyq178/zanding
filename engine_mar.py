@@ -243,7 +243,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         # 手动下采样模拟多尺度输入
         imgs_lr = degradation_codeformer(
             imgs_hr, 
-            out_size=target_eval_size,       
+            target_size=target_eval_size,       
         )
 
         # SwinIR 预处理
