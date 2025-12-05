@@ -18,7 +18,7 @@ from dataset.degradation import (
 )
 
 class SRDataset(Dataset):
-    def __init__(self, root, hr_size=256, lr_size=64, is_train=True, degradation_type='realesrgan'):
+    def __init__(self, root, hr_size=256, lr_size=64, is_train=True, degradation_type='codeformer'):
         """
         Args:
             degradation_type (str): 'codeformer' (一阶退化) 或 'realesrgan' (高阶退化)
@@ -112,11 +112,12 @@ class SRDataset(Dataset):
         img_hr_np = np.array(img_hr).astype(np.float32) / 255.0
         
         # 3. 生成 LR
+        img_lq = img_hr_np.copy()
         
-        if self.degradation_type == 'codeformer':
-            img_lq = self._getitem_codeformer(img_hr_np)
-        elif self.degradation_type == 'realesrgan':
-            img_lq = self._getitem_realesrgan(img_hr_np)
+        # if self.degradation_type == 'codeformer':
+        #     img_lq = self._getitem_codeformer(img_hr_np)
+        # elif self.degradation_type == 'realesrgan':
+        #     img_lq = self._getitem_realesrgan(img_hr_np)
         
 
         # 4. 转 Tensor 并归一化 ([-1, 1])
