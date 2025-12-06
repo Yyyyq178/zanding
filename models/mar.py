@@ -394,10 +394,10 @@ class MAR(nn.Module):
 
         # 显式获取 Latent 的真实高宽
         # 这就是支持长方形输入的关键：不再假设 H=W
-        _, _, h_hr, w_hr = x_hr.shape
-        _, _, h_lr, w_lr = x_lr.shape
-        shape_hr = (h_hr, w_hr)
-        shape_lr = (h_lr, w_lr)
+        #_, _, h_hr, w_hr = x_hr.shape
+        #_, _, h_lr, w_lr = x_lr.shape
+        shape_hr = (self.seq_h, self.seq_w)
+        shape_lr = (self.seq_h, self.seq_w)
 
         # patchify and mask (drop) tokens
         # 切片化
@@ -427,35 +427,33 @@ class MAR(nn.Module):
         if x_lr is None:
             raise ValueError("Super-Resolution requires LR input!")
         
-        # 精确获取 LR 的形状
-        # x_lr 是 Latent，形状 [B, C, h, w]
-        _, _, h_lr, w_lr = x_lr.shape
-        shape_lr = (h_lr, w_lr)
-        
+        shape_lr = (self.seq_h, self.seq_w)
+        shape_hr = (self.seq_h, self.seq_w)
+        num_hr_tokens = self.seq_len
         # 先展平 LR tokens
         lr_tokens = self.patchify(x_lr)
 
-        if target_seq_len is not None:
-            current_area = h_lr * w_lr
-            scale = (target_seq_len / current_area) ** 0.5
+        # if target_seq_len is not None:
+        #     current_area = h_lr * w_lr
+        #     scale = (target_seq_len / current_area) ** 0.5
             
-            h_hr = int(round(h_lr * scale))
-            w_hr = int(round(w_lr * scale))
+        #     h_hr = int(round(h_lr * scale))
+        #     w_hr = int(round(w_lr * scale))
             
-            if h_hr * w_hr != target_seq_len:
-                 # 回退策略：如果是正方形任务，直接开方
-                 if h_lr == w_lr:
-                     side = int(target_seq_len**0.5)
-                     h_hr, w_hr = side, side
-                 else:
-                     print(f"Warning: Target seq len {target_seq_len} does not match aspect ratio of LR {h_lr}x{w_lr}. Shape inference might be inaccurate.")
-        else:
-            # 默认逻辑：按照 MAR 的标准设定，Latent 边长放大 4 倍 (Area x16)
-            h_hr = h_lr * 4
-            w_hr = w_lr * 4
+        #     if h_hr * w_hr != target_seq_len:
+        #          # 回退策略：如果是正方形任务，直接开方
+        #          if h_lr == w_lr:
+        #              side = int(target_seq_len**0.5)
+        #              h_hr, w_hr = side, side
+        #          else:
+        #              print(f"Warning: Target seq len {target_seq_len} does not match aspect ratio of LR {h_lr}x{w_lr}. Shape inference might be inaccurate.")
+        # else:
+        #     # 默认逻辑：按照 MAR 的标准设定，Latent 边长放大 4 倍 (Area x16)
+        #     h_hr = h_lr * 4
+        #     w_hr = w_lr * 4
 
-        shape_hr = (h_hr, w_hr)
-        num_hr_tokens = h_hr * w_hr
+        # shape_hr = (h_hr, w_hr)
+        # num_hr_tokens = h_hr * w_hr
         # init and sample generation orders
         # 初始化掩码：全为 1 (代表全图被遮挡/未知)
         mask = torch.ones(bsz, num_hr_tokens).cuda()

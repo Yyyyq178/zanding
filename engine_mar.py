@@ -82,7 +82,7 @@ def train_one_epoch(model, vae,
             # 固定 4 倍
             samples_lr = degradation_model(samples_hr, scale=4.0)
 
-        # # ================= SwinIR 预处理 =================
+        # # ================= SwinIR 预处理(一次一张) =================
         # if swinir_model is not None:
         #     with torch.no_grad():
         #         # 范围转换 [-1, 1] -> [0, 1]
@@ -107,21 +107,19 @@ def train_one_epoch(model, vae,
         #         del lr_input, lr_cleaned, lr_cleaned_list, mini_input, mini_output
         # # ===========================================================
         # ================= SwinIR 预处理 =================
-        if swinir_model is not None:
-            with torch.no_grad():
-                # 范围转换 [-1, 1] -> [0, 1]
-                lr_input = (samples_lr + 1) / 2
-                lr_input = lr_input.flip([1])
+        # if swinir_model is not None:
+        #     with torch.no_grad():
+        #         # 范围转换 [-1, 1] -> [0, 1]
+        #         lr_input = (samples_lr + 1) / 2
                 
-                # === [修改回退] 直接批量推理 ===
-                # 既然分辨率已经改回 512，这里直接送入整个 batch
-                lr_cleaned = swinir_model(lr_input)
-                lr_cleaned = lr_cleaned.flip([1])
-                # 范围转换回 [-1, 1]
-                samples_lr = (lr_cleaned * 2) - 1
+        #         # === [修改回退] 直接批量推理 ===
+        #         # 既然分辨率已经改回 512，这里直接送入整个 batch
+        #         lr_cleaned = swinir_model(lr_input)
+        #         # 范围转换回 [-1, 1]
+        #         samples_lr = (lr_cleaned * 2) - 1
                 
-                del lr_input, lr_cleaned
-        # ===========================================================
+        #         del lr_input, lr_cleaned
+        # # ===========================================================
 
         with torch.no_grad():
             if args.use_cached:
@@ -236,7 +234,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
 
         imgs_lr = degradation_model(imgs_hr, scale=4.0)
         
-        # # SwinIR 预处理
+        # # SwinIR 预处理（一次一张图片）
         # if swinir_model is not None:
         #     with torch.no_grad():
         #         lr_input = (imgs_lr + 1) / 2
@@ -254,21 +252,19 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         #         imgs_lr = (lr_cleaned * 2) - 1
         #         del lr_input, lr_cleaned, lr_cleaned_list
 
-        # SwinIR 预处理
-        if swinir_model is not None:
-            with torch.no_grad():
-                lr_input = (imgs_lr + 1) / 2
-                lr_input = lr_input.flip([1])
+        # # SwinIR 预处理
+        # if swinir_model is not None:
+        #     with torch.no_grad():
+        #         lr_input = (imgs_lr + 1) / 2
                 
-                # === 直接批量推理 ===
-                lr_cleaned = swinir_model(lr_input)
-                lr_cleaned = lr_cleaned.flip([1])
+        #         # === 直接批量推理 ===
+        #         lr_cleaned = swinir_model(lr_input)
                 
-                samples_lr = (lr_cleaned * 2) - 1
+        #         samples_lr = (lr_cleaned * 2) - 1
                 
-                # 变量名对齐
-                imgs_lr = samples_lr 
-                del lr_input, lr_cleaned
+        #         # 变量名对齐
+        #         imgs_lr = samples_lr 
+        #         del lr_input, lr_cleaned
 
         # 2. 编码 LR (作为条件)
         with torch.no_grad():
