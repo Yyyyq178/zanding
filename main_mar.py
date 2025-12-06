@@ -207,12 +207,6 @@ def main(args):
         drop_last=True,
     )
 
-    # --- 【新增】定义验证集加载器 ---
-    # dataset_val = datasets.ImageFolder(
-    #     root=os.path.join(args.hr_data_path, 'val'),
-    #     transform=transform_train
-    # )
-    # 验证集不需要打乱 (shuffle=False)，也不需要分布式采样 (除非多卡，单卡设None即可)
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val, sampler=None,
         batch_size=args.eval_bsz, # 使用评估专用的 batch size
@@ -238,26 +232,44 @@ def main(args):
         num_heads=[6, 6, 6, 6, 6, 6],
         window_size=8, 
         mlp_ratio=2., 
-        sf=4,  # <--- 关键参数：必须与权重文件名的倍数一致 (x4)
+        sf=1,  # <--- 关键参数：必须与权重文件名的倍数一致 (x4)
         img_range=1., 
-        upsampler='nearest+conv', 
+        upsampler='', 
         resi_connection='1conv'
     )
 
     # 定义权重路径 (请确认这个路径下真的有文件)
-    swinir_path = "pretrained_models/swinir/003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth"
+    swinir_path = "pretrained_models/swinir/face_swinir_v1.ckpt"
     
     if os.path.exists(swinir_path):
-        # 加载权重
-        pretrained_dict = torch.load(swinir_path)
-        # 处理不同权重文件的 key 命名差异
-        if 'params_ema' in pretrained_dict:
-            pretrained_dict = pretrained_dict['params_ema']
-        elif 'params' in pretrained_dict:
-            pretrained_dict = pretrained_dict['params']
-            
-        swinir_model.load_state_dict(pretrained_dict, strict=True)
-        print(f"SwinIR weights loaded from {swinir_path}")
+        print(f"Loading SwinIR weights from: {swinir_path}")
+        # 加载 checkpoint (使用 cpu 映射防止 OOM)
+        checkpoint = torch.load(swinir_path, map_location='cpu')
+
+        # 提取参数字典 (适配 .ckpt 格式)
+        if 'state_dict' in checkpoint:
+            pretrained_dict = checkpoint['state_dict']
+        elif 'params_ema' in checkpoint:
+            pretrained_dict = checkpoint['params_ema']
+        elif 'params' in checkpoint:
+            pretrained_dict = checkpoint['params']
+        else:
+            pretrained_dict = checkpoint 
+
+        # 智能过滤参数数
+        model_dict = swinir_model.state_dict()
+        valid_dict = {}
+        for k, v in pretrained_dict.items():
+            if k in model_dict:
+                if v.shape == model_dict[k].shape:
+                    valid_dict[k] = v
+                else:
+                    print(f"⚠️ Skipping shape mismatch: {k} (ckpt: {v.shape}, model: {model_dict[k].shape})")
+            # else: 忽略多余的键 (如 lpips_metric)
+
+        # 4. 加载参数 (strict=False 是关键，允许忽略多余的键)
+        swinir_model.load_state_dict(valid_dict, strict=False)
+        print(f"Successfully loaded {len(valid_dict)} keys for SwinIR.")
     else:
         print(f"Warning: SwinIR weight not found at {swinir_path}. Using random init (NOT RECOMMENDED).")
 
