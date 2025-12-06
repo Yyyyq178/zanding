@@ -165,21 +165,7 @@ def main(args):
         log_writer = SummaryWriter(log_dir=args.log_dir)
     else:
         log_writer = None
-    #lr_img_size = args.img_size // 2  # 1024 / 2 = 512
-    
-    # transform_lr = transforms.Compose([
-    #     transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, lr_img_size)),
-    #     # transforms.RandomHorizontalFlip(),  
-    #     transforms.ToTensor(),
-    #     transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-    # ])
-    # augmentation following DiT and ADM
-    # transform_train = transforms.Compose([
-    #     transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.img_size)),
-    #     transforms.RandomHorizontalFlip(),
-    #     transforms.ToTensor(),
-    #     transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-    # ])
+ 
     if args.use_cached:
         raise NotImplementedError("Cached mode needs update for SRDataset")
     else:
@@ -207,15 +193,6 @@ def main(args):
         )
 
     print(dataset_train)
-
-    # if args.use_cached:
-    #     dataset_train = CachedFolder(args.cached_path)
-    # else:
-    #     dataset_train = datasets.ImageFolder(
-    #         root=os.path.join(args.hr_data_path, 'train'),
-    #         transform=transform_train
-    #     )
-    # print(dataset_train)
 
     sampler_train = torch.utils.data.DistributedSampler(
         dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True

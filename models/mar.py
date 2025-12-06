@@ -110,7 +110,7 @@ class MAR(nn.Module):
                  num_sampling_steps='100',
                  diffusion_batch_mul=1,         #单卡最好设为1，之前为4
                  grad_checkpointing=False,
-                 mse_weight=0.2,
+                 mse_weight=0.25,
                  ):
         super().__init__()
 
@@ -126,14 +126,6 @@ class MAR(nn.Module):
         self.token_embed_dim = vae_embed_dim * patch_size**2
         self.grad_checkpointing = grad_checkpointing
         self.mse_weight = mse_weight
-
-        # --------------------------------------------------------------------------
-        # Class Embedding
-        #self.num_classes = class_num
-        #self.class_emb = nn.Embedding(class_num, encoder_embed_dim)
-        #self.label_drop_prob = label_drop_prob
-        # Fake class embedding for CFG's unconditional generation
-        #self.fake_latent = nn.Parameter(torch.zeros(1, encoder_embed_dim))
 
         # --------------------------------------------------------------------------
         # MAR variant masking ratio, a left-half truncated Gaussian centered at 100% masking ratio with std 0.25
@@ -382,13 +374,13 @@ class MAR(nn.Module):
         bsz, seq_len, _ = target.shape
 
         # 每一张图片在一次 Forward 中同时学习 4 个不同的扩散时间步（diffusion_batch_mul）
-        target_diff = target.reshape(bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)#新注释的，需要还原
-        z_diff = z.reshape(bsz*seq_len, -1).repeat(self.diffusion_batch_mul, 1)#新注释的，需要还原
-        mask_diff = mask.reshape(bsz*seq_len).repeat(self.diffusion_batch_mul)#新注释的，需要还原
+        target_diff = target.reshape(bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)
+        z_diff = z.reshape(bsz*seq_len, -1).repeat(self.diffusion_batch_mul, 1)
+        mask_diff = mask.reshape(bsz*seq_len).repeat(self.diffusion_batch_mul)
 
 
         # z 是条件 (Condition)，target 是要加噪的数据 (x_start)
-        loss_diff = self.diffloss(z=z_diff, target=target_diff, mask=mask_diff)#新注释的，需要还原
+        loss_diff = self.diffloss(z=z_diff, target=target_diff, mask=mask_diff)
 
         loss = loss_diff + self.mse_weight * loss_mse
         
@@ -443,22 +435,13 @@ class MAR(nn.Module):
         # 先展平 LR tokens
         lr_tokens = self.patchify(x_lr)
 
-        # 智能推断 HR 形状 (支持长方形)
         if target_seq_len is not None:
-            # 如果外部指定了目标 Token 总数 (通常用于验证集对齐)
-            # 我们假设 HR 应该保持 LR 的长宽比
-            # area_hr = target_seq_len
-            # area_lr = h_lr * w_lr
-            # scale = sqrt(area_hr / area_lr)
             current_area = h_lr * w_lr
             scale = (target_seq_len / current_area) ** 0.5
             
             h_hr = int(round(h_lr * scale))
             w_hr = int(round(w_lr * scale))
             
-            # 修正取整误差：如果乘积不等于 target_seq_len，优先调整长边或允许微小 mismatch
-            # (但在 Token 序列生成中，长度必须严格匹配，所以通常这里计算出的 h*w 应该等于 target_seq_len)
-            # 为了安全起见，如果算出来不对，我们强制使用开根号兜底（针对正方形情况），或者报错
             if h_hr * w_hr != target_seq_len:
                  # 回退策略：如果是正方形任务，直接开方
                  if h_lr == w_lr:
@@ -483,12 +466,6 @@ class MAR(nn.Module):
 
         # 直接调用修改后的 sample_orders，不用手写循环了
         orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
-        # orders = []
-        # for _ in range(bsz):
-        #     order = np.array(list(range(num_hr_tokens))) # 使用动态长度
-        #     np.random.shuffle(order)
-        #     orders.append(order)
-        #orders = torch.Tensor(np.array(orders)).cuda().long()
 
         indices = list(range(num_iter))
         if progress:

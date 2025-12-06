@@ -9,8 +9,7 @@ import util.misc as misc
 import util.lr_sched as lr_sched
 import torch.nn.functional as F
 from models.vae import DiagonalGaussianDistribution
-from dataset.codeformer import degradation_codeformer
-#import torch_fidelity
+from dataset.codeformer import CodeFormerDegradation
 import pyiqa
 import shutil
 import cv2
@@ -56,6 +55,14 @@ def train_one_epoch(model, vae,
     if args.steps_per_epoch > 0 and args.steps_per_epoch < len(data_loader):
         num_steps_per_epoch = args.steps_per_epoch
 
+    degradation_model = CodeFormerDegradation(
+        blur_prob=0.5,
+        blur_sigma_range=(0.1, 12.0),
+        downsample_scale_range=(2.0, 4.0),
+        noise_prob=0.5,
+        noise_sigma_range=(0, 15.0/255.0)
+    )
+
     for data_iter_step, (samples_hr, samples_lr, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
         # 如果当前步数达到了我们设定的限制，直接强行结束这一轮，进入 Validation
@@ -67,56 +74,38 @@ def train_one_epoch(model, vae,
 
         # 把数据移到 GPU
         samples_hr = samples_hr.to(device, non_blocking=True)
-        #samples_lr = samples_lr.to(device, non_blocking=True)
 
         if args.multi_scale: 
-            # 生成一个 [64, 128] 之间的随机整数尺寸
-            target_lr_size = np.random.randint(64, 129)
-            #target_w = np.random.randint(64, 129)
-            
-            # 为了配合 VAE，建议调整为 16 的倍数 (可选，但推荐)
-            #target_h = (target_h // 16) * 16
-            #target_w = (target_w // 16) * 16
-
-            # 强制正方形训练：
-            #target_w = target_h 
-            samples_lr = degradation_codeformer(samples_hr, target_lr_size)
-            # 如果生成的尺寸不是 256 (原始尺寸)，则进行下采样        
-            samples_lr_input = F.interpolate(
-                samples_lr, 
-                size=(target_lr_size, target_lr_size), 
-                mode='bilinear', 
-                align_corners=False,
-                antialias=True # 推荐开启抗锯齿，防止缩放伪影
-            )
+            # scale=None -> 随机 2-4 倍
+            samples_lr = degradation_model(samples_hr, scale=None) 
         else:
-            samples_lr = samples_lr.to(device, non_blocking=True)
+            # 固定 4 倍
+            samples_lr = degradation_model(samples_hr, scale=4.0)
 
         # ================= SwinIR 预处理 =================
         if swinir_model is not None:
             with torch.no_grad():
                 # 范围转换 [-1, 1] -> [0, 1]
-                lr_input = (samples_lr_input + 1) / 2
+                lr_input = (samples_lr + 1) / 2
+                lr_cleaned_list = []
+                mini_batch_size = 1
+                for i in range(0, lr_input.size(0), mini_batch_size):
+                    # 取出切片
+                    mini_input = lr_input[i : i + mini_batch_size]
+                    # 推理
+                    mini_output = swinir_model(mini_input)
+                    lr_cleaned_list.append(mini_output)
                 
-                # SwinIR 推理
-                # 注意：如果 SwinIR 是 x4 模型，输出尺寸会变大 4 倍
-                lr_cleaned = swinir_model(lr_input)
-                
-                # 尺寸控制
-                if lr_cleaned.shape[-1] != samples_hr.shape[-1]:
-                    lr_cleaned = F.interpolate(
-                        lr_cleaned, 
-                        size=samples_hr.shape[-2:], 
-                        mode='bicubic', 
-                        align_corners=False,
-                        antialias=True
-                    )
-                
-                # 范围转换回 [-1, 1] 给 VAE
+                # 拼回完整的 Batch
+                lr_cleaned = torch.cat(lr_cleaned_list, dim=0)
+                # -----------------------------------
+
+                # 范围转换回 [-1, 1]
                 samples_lr = (lr_cleaned * 2) - 1
                 
-                # 显存清理
-                del lr_input, lr_cleaned, samples_lr_input
+                # [修复报错] 显存清理 & 删除不存在的变量
+                del lr_input, lr_cleaned, lr_cleaned_list, mini_input, mini_output
+                torch.cuda.empty_cache()
         # ===========================================================
 
         with torch.no_grad():
@@ -173,7 +162,6 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
              use_ema=True, data_loader=None, swinir_model=None):
     torch.cuda.empty_cache()
     model_without_ddp.eval()
-    #num_steps = args.num_images // (batch_size * misc.get_world_size()) + 1
     save_folder = os.path.join(args.output_dir, "ariter{}-diffsteps{}-temp{}-{}cfg{}-image_num{}".format(args.num_iter,
                                                                                                      args.num_sampling_steps,
                                                                                                      args.temperature,
@@ -216,7 +204,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
     # 使用 misc.MetricLogger 来自动管理所有 GPU 上的平均分计算
     metric_logger = misc.MetricLogger(delimiter="  ")
     # -------------------------------------------
-
+    degradation_model = CodeFormerDegradation()
     print(f"Start evaluation on {len(data_loader)} batches...")
     
     # 开始遍历验证集 (HR, LR)
@@ -231,37 +219,27 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
             print("Finished 5 batches preview, stopping evaluation.")
             break 
 
-        # 线性均匀分布
-        # 将 batch_index 映射到 [64, 128] 区间
-        # 例如：第1个batch测64，第2个测65... 循环往复
-        offset = i % (128 - 64 + 1) # 范围 0 ~ 64
-        target_eval_size = 64 + offset
+        imgs_lr = degradation_model(imgs_hr, scale=4.0)
         
-        # 如果想要完全随机（和训练一模一样，但指标会抖动）
-        # target_eval_size = np.random.randint(64, 129)
-
-        # 手动下采样模拟多尺度输入
-        imgs_lr = degradation_codeformer(
-            imgs_hr, 
-            target_size=target_eval_size,       
-        )
-
         # SwinIR 预处理
         if swinir_model is not None:
             with torch.no_grad():
                 lr_input = (imgs_lr + 1) / 2
-                lr_cleaned = swinir_model(lr_input)
-                # 强制对齐回 HR 尺寸 (256)
-                if lr_cleaned.shape[-1] != imgs_hr.shape[-1]:
-                    lr_cleaned = F.interpolate(
-                        lr_cleaned, 
-                        size=imgs_hr.shape[-2:], 
-                        mode='bicubic', 
-                        align_corners=False,
-                        antialias=True # 验证时建议开启抗锯齿，保证质量
-                    )
+                
+                # --- [显存优化] 验证集切片推理 ---
+                lr_cleaned_list = []
+                mini_batch_size = 1
+                for j in range(0, lr_input.size(0), mini_batch_size):
+                    mini_input = lr_input[j : j + mini_batch_size]
+                    mini_output = swinir_model(mini_input)
+                    lr_cleaned_list.append(mini_output)
+                lr_cleaned = torch.cat(lr_cleaned_list, dim=0)
+                # -------------------------------
+
                 imgs_lr = (lr_cleaned * 2) - 1
-                del lr_input, lr_cleaned
+                del lr_input, lr_cleaned, lr_cleaned_list
+                torch.cuda.empty_cache()
+                
         # 2. 编码 LR (作为条件)
         with torch.no_grad():
             posterior_lr = vae.encode(imgs_lr)

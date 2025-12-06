@@ -21,18 +21,18 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --cfg 1.0 \
     --epochs 800 \
     --warmup_epochs 10 \
-    --batch_size 16 \
+    --batch_size 4 \
     --grad_clip 1.0 \
     --steps_per_epoch 250 \
-    --blr 1.0e-2 \
+    --blr 2.0e-2 \
     --hr_data_path /root/autodl-tmp/zanding/data \
     --val_data_path /root/autodl-tmp/zanding/data \
-    --output_dir output_sr_train_diffusionloss_codeformer_swinir_2 \
+    --output_dir output_sr_train_diffusionloss_codeformer_swinir_3 \
     --degradation codeformer \
     --eval_freq 2 \
     --save_last_freq 2 \
     --eval_bsz 16 \
-    --img_size 256 \
+    --img_size 512 \
     --multi_scale \
     --lr_schedule cosine \
     --online_eval
