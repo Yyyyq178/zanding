@@ -55,13 +55,8 @@ def train_one_epoch(model, vae,
     if args.steps_per_epoch > 0 and args.steps_per_epoch < len(data_loader):
         num_steps_per_epoch = args.steps_per_epoch
 
-    degradation_model = CodeFormerDegradation(
-        blur_prob=0.5,
-        blur_sigma_range=(0.1, 12.0),
-        downsample_scale_range=(2.0, 4.0),
-        noise_prob=0.5,
-        noise_sigma_range=(0, 15.0/255.0)
-    )
+    degradation_model = CodeFormerDegradation()
+        
 
     for data_iter_step, (samples_hr, samples_lr, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
@@ -75,12 +70,12 @@ def train_one_epoch(model, vae,
         # 把数据移到 GPU
         samples_hr = samples_hr.to(device, non_blocking=True)
 
-        if args.multi_scale: 
+        # if args.multi_scale: 
             # scale=None -> 随机 2-4 倍
-            samples_lr = degradation_model(samples_hr, scale=None) 
-        else:
-            # 固定 4 倍
-            samples_lr = degradation_model(samples_hr, scale=4.0)
+        samples_lr = degradation_model(samples_hr, scale=None) 
+        # else:
+        #     # 固定 4 倍
+        #     samples_lr = degradation_model(samples_hr, scale=4.0)
 
         # # ================= SwinIR 预处理(一次一张) =================
         # if swinir_model is not None:
