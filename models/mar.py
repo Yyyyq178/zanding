@@ -1,4 +1,3 @@
-#定义了 MAR 的主体架构
 from functools import partial
 
 import numpy as np
@@ -9,81 +8,125 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from timm.models.vision_transformer import Block
+from timm.models.vision_transformer import Block, Mlp, DropPath
 
 from models.diffloss import DiffLoss
 
+# =========================================================================
+# RoPE 核心函数
+# =========================================================================
 
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    """为广播操作重塑频率张量的形状"""
+    ndim = x.ndim
+    assert 0 <= 1 < ndim
+    if freqs_cis.ndim < 3:
+        # 适配 [B, L, H, D] 格式，在 H (head) 维度广播
+        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    else:
+        shape = [d if i == 1 or i == ndim - 1 or i == 0 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
 
-def get_1d_sincos_pos_embed_from_grid_torch(embed_dim, pos):
+def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor):
     """
-    pos: [N] tensor
-    """
-    assert embed_dim % 2 == 0
-    omega = torch.arange(embed_dim // 2, dtype=torch.float, device=pos.device)
-    omega /= embed_dim / 2.
-    omega = 1. / 10000**omega  # (D/2,)
-
-    pos = pos.reshape(-1)  # (N,)
-    out = torch.einsum('m,d->md', pos, omega)  # (N, D/2)
-
-    emb_sin = torch.sin(out)
-    emb_cos = torch.cos(out)
-
-    emb = torch.cat([emb_sin, emb_cos], dim=1)  # (N, D)
-    return emb
-
-def get_2d_sincos_pos_embed_from_grid_torch(embed_dim, grid):
-    """
-    grid: [2, H, W]
-    """
-    assert embed_dim % 2 == 0
-    # 前一半维度编码 H (y轴)，后一半维度编码 W (x轴)
-    emb_h = get_1d_sincos_pos_embed_from_grid_torch(embed_dim // 2, grid[0].flatten())
-    emb_w = get_1d_sincos_pos_embed_from_grid_torch(embed_dim // 2, grid[1].flatten())
-    
-    emb = torch.cat([emb_h, emb_w], dim=1) # (H*W, D)
-    return emb
-
-def get_2d_sincos_pos_embed_torch(embed_dim, grid_size_hr, grid_size_lr, device, base_size=16):
-    """
-    生成 2D 绝对位置编码，支持任意分辨率归一化。
-    
+    应用旋转位置编码 (复数乘法实现)
     Args:
-        embed_dim: 输出维度
-        grid_size_hr: tuple (h_hr, w_hr) -> HR 特征图的 (高, 宽)
-        grid_size_lr: tuple (h_lr, w_lr) -> LR 特征图的 (高, 宽)
-        device: 设备
-        base_size: 归一化基准大小 (建议设为训练时 token 的默认边长，如 16)
+        xq: [B, L, H, D]
+        xk: [B, L, H, D]
+        freqs_cis: [L, D] (complex64)
     """
-    h_hr, w_hr = grid_size_hr
-    h_lr, w_lr = grid_size_lr
+    # 将输入转换为复数形式: (..., D) -> (..., D/2, 2) -> complex
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     
-    # === 归一化坐标系 ===
-    # 逻辑：(坐标 + 0.5) / 当前边长 * 基准边长
-    # 效果：无论分辨率由多大，都被映射到 [0, base_size] 的连续空间
+    # 广播 freqs_cis
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
     
-    # 1. 生成 HR 网格 (Pixel Center Alignment)
-    grid_h = (torch.arange(h_hr, dtype=torch.float, device=device) + 0.5) / h_hr * base_size
-    grid_w = (torch.arange(w_hr, dtype=torch.float, device=device) + 0.5) / w_hr * base_size
-    grid_x, grid_y = torch.meshgrid(grid_w, grid_h, indexing='xy')
-    grid_hr = torch.stack([grid_y, grid_x], dim=0) # [2, H, W]
+    # 复数乘法应用旋转，然后转回实数并展平
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+# =========================================================================
+# 自定义支持 RoPE 的 Transformer Block
+# =========================================================================
 
-    # 2. 生成 LR 网格
-    # LR 网格在同一空间下的坐标。
-    # 只要 HR 和 LR 覆盖相同的物理视野（FOV），这种归一化就能保证它们空间对齐。
-    grid_l_h = (torch.arange(h_lr, dtype=torch.float, device=device) + 0.5) / h_lr * base_size
-    grid_l_w = (torch.arange(w_lr, dtype=torch.float, device=device) + 0.5) / w_lr * base_size
-    grid_lx, grid_ly = torch.meshgrid(grid_l_w, grid_l_h, indexing='xy')
-    grid_lr = torch.stack([grid_ly, grid_lx], dim=0) # [2, h_lr, w_lr]
+class RoPEAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
 
-    # 3. 计算 Sin/Cos 编码 (调用原有函数)
-    pos_embed_hr = get_2d_sincos_pos_embed_from_grid_torch(embed_dim, grid_hr)
-    pos_embed_lr = get_2d_sincos_pos_embed_from_grid_torch(embed_dim, grid_lr)
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
 
-    # 4. 拼接 (Buffer/LR 在前)
-    pos_embed = torch.cat([pos_embed_lr, pos_embed_hr], dim=0).unsqueeze(0)
-    return pos_embed
+    def forward(self, x, freqs_cis=None):
+        B, N, C = x.shape
+        # qkv: [3, B, num_heads, N, head_dim]
+        # 注意这里 permute 成了 (2, 0, 3, 1, 4) -> [3, B, H, N, D]
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # === 注入 RoPE (VARSR 风格) ===
+        if freqs_cis is not None:
+            # apply_rotary_emb 期望输入为 [B, L, H, D]
+            # 当前 q, k 是 [B, H, L, D]，需要 permute
+            q = q.transpose(1, 2) # -> [B, L, H, D]
+            k = k.transpose(1, 2)
+            q, k = apply_rotary_emb(q, k, freqs_cis)
+            q = q.transpose(1, 2) # -> [B, H, L, D]
+            k = k.transpose(1, 2)
+        # ============================
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+class RoPEBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        # 使用自定义的 RoPEAttention
+        self.attn = RoPEAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward(self, x, freqs_cis=None):
+        # 将 freqs_cis 传入 Attention
+        x = x + self.drop_path(self.attn(self.norm1(x), freqs_cis=freqs_cis))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+    
+def precompute_freqs_cis_2d(dim: int, coords_h, coords_w, theta: float = 10000.0):
+    """
+    根据给定的 H 和 W 坐标预计算 2D RoPE 频率
+    """
+    # dim 分给 X 和 Y 各一半 (dim//4 * 2 = dim//2 in complex)
+    # 计算基础频率
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 4)[: (dim // 4)].float() / dim)).to(coords_h.device)
+    
+    # 生成外积：坐标 * 频率
+    freqs_h = torch.outer(coords_h, freqs) # [L, dim//4]
+    freqs_w = torch.outer(coords_w, freqs) # [L, dim//4]
+    
+    # 转为极坐标复数形式 (Modulus=1, Angle=freqs)
+    freqs_cis_h = torch.polar(torch.ones_like(freqs_h), freqs_h) # complex64
+    freqs_cis_w = torch.polar(torch.ones_like(freqs_w), freqs_w) # complex64
+    
+    # 拼接 H 和 W 的编码 -> [L, dim//2] (complex)
+    freqs_cis = torch.cat([freqs_cis_h, freqs_cis_w], dim=1) 
+    return freqs_cis
 
 def mask_by_order(mask_len, order, bsz, seq_len):
     masking = torch.zeros(bsz, seq_len).cuda()
@@ -145,9 +188,12 @@ class MAR(nn.Module):
         #self.encoder_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, encoder_embed_dim))
 
         # Transformer Blocks：堆叠 16 层
+        # self.encoder_blocks = nn.ModuleList([
+        #     Block(encoder_embed_dim, encoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
+        #           proj_drop=proj_dropout, attn_drop=attn_dropout) for _ in range(encoder_depth)])
         self.encoder_blocks = nn.ModuleList([
-            Block(encoder_embed_dim, encoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
-                  proj_drop=proj_dropout, attn_drop=attn_dropout) for _ in range(encoder_depth)])
+            RoPEBlock(encoder_embed_dim, encoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
+                    drop=proj_dropout, attn_drop=attn_dropout) for _ in range(encoder_depth)])
         self.encoder_norm = norm_layer(encoder_embed_dim)
 
         # --------------------------------------------------------------------------
@@ -161,9 +207,12 @@ class MAR(nn.Module):
         #self.decoder_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, decoder_embed_dim))
 
         # Transformer Blocks：堆叠 16 层
+        # self.decoder_blocks = nn.ModuleList([
+        #     Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
+        #           proj_drop=proj_dropout, attn_drop=attn_dropout) for _ in range(decoder_depth)])
         self.decoder_blocks = nn.ModuleList([
-            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
-                  proj_drop=proj_dropout, attn_drop=attn_dropout) for _ in range(decoder_depth)])
+            RoPEBlock(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
+                    drop=proj_dropout, attn_drop=attn_dropout) for _ in range(decoder_depth)])
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
         # Diffusion 位置编码：这是给 DiffLoss 用的额外位置信息
@@ -264,7 +313,44 @@ class MAR(nn.Module):
         mask = torch.scatter(mask, dim=-1, index=orders[:, :num_masked_tokens],
                              src=torch.ones(bsz, seq_len, device=x.device))
         return mask
+    
+    # [新增] 生成 2D RoPE 频率的方法
+    def get_rope_freqs(self, shape_hr, shape_lr, device, head_dim):
+        """
+        生成 LR + HR 拼接后的 2D RoPE 频率
+        输出形状: [1, L_total, D//2] (complex)
+        """
+        h_hr, w_hr = shape_hr
+        h_lr, w_lr = shape_lr
+        
+        # 1. 生成归一化坐标 (类似 VARSR 使用 meshgrid)
+        # 使用 self.seq_h 作为 base_size 进行归一化，保持尺度一致性
+        base_size = self.seq_h
+        
+        # HR 坐标
+        grid_h_hr = (torch.arange(h_hr, device=device) + 0.5) / h_hr * base_size
+        grid_w_hr = (torch.arange(w_hr, device=device) + 0.5) / w_hr * base_size
+        mesh_y_hr, mesh_x_hr = torch.meshgrid(grid_h_hr, grid_w_hr, indexing='ij')
+        coords_h_hr = mesh_y_hr.flatten()
+        coords_w_hr = mesh_x_hr.flatten()
 
+        # LR 坐标
+        grid_h_lr = (torch.arange(h_lr, device=device) + 0.5) / h_lr * base_size
+        grid_w_lr = (torch.arange(w_lr, device=device) + 0.5) / w_lr * base_size
+        mesh_y_lr, mesh_x_lr = torch.meshgrid(grid_h_lr, grid_w_lr, indexing='ij')
+        coords_h_lr = mesh_y_lr.flatten()
+        coords_w_lr = mesh_x_lr.flatten()
+
+        # 拼接: LR (buffer) 在前，然后是 HR
+        coords_h = torch.cat([coords_h_lr, coords_h_hr], dim=0)
+        coords_w = torch.cat([coords_w_lr, coords_w_hr], dim=0)
+
+        # 2. 计算频率 (调用第一步定义的函数)
+        freqs_cis = precompute_freqs_cis_2d(head_dim, coords_h, coords_w)
+        
+        # 增加 Batch 维度 [L, D//2]
+        return freqs_cis
+    
     def forward_mae_encoder(self, x_hr, mask, x_lr, shape_hr, shape_lr):
         # x: [Batch, Seq_Len=256, Dim=16] (VAE 输出的 token)
         # mask: [Batch, Seq_Len=256] (0=可见, 1=遮挡)
@@ -273,91 +359,84 @@ class MAR(nn.Module):
         lr_embedding = self.z_proj(x_lr)
         bsz, seq_len, embed_dim = hr_embedding.shape
 
-        # concat buffer
-        # x = torch.cat([torch.zeros(bsz, self.buffer_size, embed_dim, device=x.device), x], dim=1)
+        # 获取 head_dim
+        num_heads = self.encoder_blocks[0].attn.num_heads
+        head_dim = embed_dim // num_heads
+
+        # 拼接 Features
+        # [修改] 移除中间定义的 pos_embed 变量和加法
         x = torch.cat([lr_embedding, hr_embedding], dim=1)
 
-        # 4. 实时生成位置编码
-        # 调用我们在第一步添加的 torch 版本函数
-        # 注意传入 x.device，确保生成的编码在 GPU 上
-        pos_embed = get_2d_sincos_pos_embed_torch(
-            embed_dim, shape_hr, shape_lr, x.device, base_size=self.seq_h
-        )
-        
-        # 5. 加上位置编码
-        x = x + pos_embed
+        # 计算完整的 RoPE 频率
+        freqs_cis_full = self.get_rope_freqs(shape_hr, shape_lr, x.device, head_dim)
+        freqs_cis_full = freqs_cis_full.unsqueeze(0).repeat(bsz, 1, 1) # 扩展到 Batch
 
-        # 给buffer打上0，表示永远可见
-        #mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
-        #mask_with_buffer = torch.cat([torch.zeros(x.size(0), num_lr_tokens, device=x.device), mask], dim=1)
+        # 构造 Mask (LR 永远可见)
         num_lr_tokens = shape_lr[0] * shape_lr[1]
-
-        mask_with_buffer = torch.cat([torch.zeros(x.size(0), num_lr_tokens, device=x.device), mask], dim=1)
+        mask_with_buffer = torch.cat([torch.zeros(bsz, num_lr_tokens, device=x.device), mask], dim=1)
+        
         x = self.z_proj_ln(x)
 
-        # dropping
-        # 只取出 mask=0 的位置。这一步极大地减少了计算量
-        x = x[(1-mask_with_buffer).nonzero(as_tuple=True)].reshape(bsz, -1, embed_dim)
+        # Dropping (同时筛选 Feature 和 频率)
+        keep_indices = (1 - mask_with_buffer).nonzero(as_tuple=True)
+        
+        # 计算保留的 token 数量 (假设 batch 内一致，通常 MAR 设计也是如此)
+        num_kept = int(mask_with_buffer.shape[1] - mask_with_buffer.sum(dim=1)[0].item())
+        
+        # 筛选 Feature
+        x = x[keep_indices].reshape(bsz, num_kept, embed_dim)
+        
+        # [新增] 筛选 Frequencies
+        freqs_cis_kept = freqs_cis_full[keep_indices].reshape(bsz, num_kept, -1)
 
-        # apply Transformer blocks
-        # 此时 x 的长度变短了 (比如从 320 变成了 64+几十个可见token)
+        # Apply Transformer Blocks (传入 freqs_cis)
         for block in self.encoder_blocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():         
-                x = checkpoint(block, x)
+                # [修改] 传入 freqs_cis=freqs_cis_kept
+                x = checkpoint(block, x, freqs_cis_kept, use_reentrant=False)
             else:
-                x = block(x)
+                x = block(x, freqs_cis=freqs_cis_kept)
         x = self.encoder_norm(x)
 
         return x
 
     def forward_mae_decoder(self, x, mask, shape_hr, shape_lr):
-        # x: Encoder 的输出 (只有可见部分 + Buffer)
-        # mask: 原始的遮挡掩码
         x = self.decoder_embed(x)
-
-        # 根据真实形状计算 LR Token 总数
         num_lr_tokens = shape_lr[0] * shape_lr[1]
+        bsz = x.shape[0]
+        embed_dim = x.shape[-1]
+        # 获取 head_dim
+        num_heads = self.decoder_blocks[0].attn.num_heads
+        head_dim = embed_dim // num_heads
 
-        # 重建带有 buffer 的完整 mask
-        mask_with_buffer = torch.cat([torch.zeros(x.size(0), num_lr_tokens, device=x.device), mask], dim=1)
-
-        # pad mask tokens（填补空缺）
-        # 先造一个全是不可见的底板，形状是完整的[Batch, 320, dim]
-        mask_tokens = self.mask_token.repeat(mask_with_buffer.shape[0], mask_with_buffer.shape[1], 1).to(x.dtype)
+        # Pad Mask Tokens
+        mask_with_buffer = torch.cat([torch.zeros(bsz, num_lr_tokens, device=x.device), mask], dim=1)
+        mask_tokens = self.mask_token.repeat(bsz, mask_with_buffer.shape[1], 1).to(x.dtype)
         x_after_pad = mask_tokens.clone()
-        # 把可见特征填回它原来的位置
-        x_after_pad[(1 - mask_with_buffer).nonzero(as_tuple=True)] = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+        
+        keep_indices = (1 - mask_with_buffer).nonzero(as_tuple=True)
+        x_after_pad[keep_indices] = x.reshape(-1, embed_dim)
+        x = x_after_pad
 
-        # 调用新的位置编码函数
-        # 1. 传入 shape_hr, shape_lr
-        # 2. 传入 base_size=self.seq_h 进行归一化
-        pos_embed = get_2d_sincos_pos_embed_torch(
-            self.decoder_embed.out_features, 
-            shape_hr, 
-            shape_lr, 
-            x.device,
-            base_size=self.seq_h
-        )
-        # decoder position embedding
-        x = x_after_pad + pos_embed
+        # 计算完整 RoPE 频率
+        freqs_cis_full = self.get_rope_freqs(shape_hr, shape_lr, x.device, head_dim)
+        # 注意：这里不需要 repeat 到 batch 维度，apply_rotary_emb 会处理广播，
+        # 或者为了保险起见，跟 Encoder 保持一致：
+        #freqs_cis_full = freqs_cis_full.repeat(bsz, 1, 1) # 可选，视显存情况而定
 
-        # apply Transformer blocks
-        # Decoder 处理的是完整的长序列 (320)
-        # 它要利用可见信息，去“猜” mask_token 那个位置应该是什么
+        # Apply Transformer Blocks
         if self.grad_checkpointing and not torch.jit.is_scripting():
             for block in self.decoder_blocks:
-                x = checkpoint(block, x)
+                # [修改] 传入 freqs_cis
+                x = checkpoint(block, x, freqs_cis_full, use_reentrant=False)
         else:
             for block in self.decoder_blocks:
-                x = block(x)
+                x = block(x, freqs_cis=freqs_cis_full)
         x = self.decoder_norm(x)
 
-        # 移除buffer
+        # 移除 Buffer (LR tokens)
         x = x[:, num_lr_tokens:]
-        # 加上diffusion位置编码
-        pos_embed_hr_only = pos_embed[:, num_lr_tokens:, :]
-        x = x + pos_embed_hr_only
-        
+
         return x
 
     def forward_loss(self, z, target, mask):

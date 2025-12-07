@@ -1,4 +1,3 @@
-#封装了具体的训练和评估逻辑。
 import math
 import sys
 from typing import Iterable
@@ -114,6 +113,7 @@ def train_one_epoch(model, vae,
         #         samples_lr = (lr_cleaned * 2) - 1
                 
         #         del lr_input, lr_cleaned
+        #         torch.cuda.empty_cache()
         # # ===========================================================
 
         with torch.no_grad():

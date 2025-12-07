@@ -1,4 +1,3 @@
-#主程序入口，用于训练和评估
 import argparse
 import datetime
 import numpy as np
