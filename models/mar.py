@@ -393,7 +393,7 @@ class MAR(nn.Module):
         for block in self.encoder_blocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():         
                 # [修改] 传入 freqs_cis=freqs_cis_kept
-                x = checkpoint(block, x, freqs_cis_kept, use_reentrant=False)
+                x = checkpoint(block, x, freqs_cis_kept)
             else:
                 x = block(x, freqs_cis=freqs_cis_kept)
         x = self.encoder_norm(x)
@@ -422,13 +422,13 @@ class MAR(nn.Module):
         freqs_cis_full = self.get_rope_freqs(shape_hr, shape_lr, x.device, head_dim)
         # 注意：这里不需要 repeat 到 batch 维度，apply_rotary_emb 会处理广播，
         # 或者为了保险起见，跟 Encoder 保持一致：
-        #freqs_cis_full = freqs_cis_full.repeat(bsz, 1, 1) # 可选，视显存情况而定
+        freqs_cis_full = freqs_cis_full.repeat(bsz, 1, 1) # 可选，视显存情况而定
 
         # Apply Transformer Blocks
         if self.grad_checkpointing and not torch.jit.is_scripting():
             for block in self.decoder_blocks:
                 # [修改] 传入 freqs_cis
-                x = checkpoint(block, x, freqs_cis_full, use_reentrant=False)
+                x = checkpoint(block, x, freqs_cis_full)
         else:
             for block in self.decoder_blocks:
                 x = block(x, freqs_cis=freqs_cis_full)

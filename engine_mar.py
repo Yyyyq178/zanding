@@ -62,6 +62,7 @@ def train_one_epoch(model, vae,
         # 如果当前步数达到了我们设定的限制，直接强行结束这一轮，进入 Validation
         if args.steps_per_epoch > 0 and data_iter_step >= args.steps_per_epoch:
             break
+        #torch.cuda.empty_cache()
 
         # we use a per iteration (instead of per epoch) lr scheduler
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / num_steps_per_epoch + epoch, args)
@@ -217,8 +218,10 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
     
     # 开始遍历验证集 (HR, LR)
     for i, (imgs_hr, imgs_lr, filenames) in enumerate(data_loader):
-        
-        # 1. 准备数据
+
+        #torch.cuda.empty_cache()
+
+        # 准备数据
         imgs_hr = imgs_hr.cuda(args.device, non_blocking=True)
         #imgs_lr = imgs_lr.cuda(non_blocking=True)
         #imgs_lr = imgs_lr.cuda(args.device, non_blocking=True)
@@ -261,7 +264,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         #         imgs_lr = samples_lr 
         #         del lr_input, lr_cleaned
 
-        # 2. 编码 LR (作为条件)
+        # 编码 LR (作为条件)
         with torch.no_grad():
             posterior_lr = vae.encode(imgs_lr)
             x_lr = posterior_lr.sample().mul_(0.2325) 
@@ -271,7 +274,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         feat_h, feat_w = h_hr // 16, w_hr // 16 # 假设 stride=16
         target_seq_len = feat_h * feat_w
 
-        # 3. 生成 (Inference)
+        # 生成 (Inference)
         with torch.no_grad():
             with torch.amp.autocast('cuda'):
                 # 调用 sample_tokens，传入 x_lr
@@ -288,7 +291,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
                 # 解码生成的 Token 变回图片
                 sampled_images = vae.decode(sampled_tokens / 0.2325)
 
-        # 1. 数据预处理：将范围从 [-1, 1] 转换到 [0, 1]
+        # 数据预处理：将范围从 [-1, 1] 转换到 [0, 1]
         # 注意：pyiqa 期望输入是 [0, 1] 的 float32 Tensor
         sr_tensor = (sampled_images + 1) / 2
         sr_tensor = sr_tensor.clamp(0, 1).float()  # 截断防止越界
@@ -296,18 +299,18 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         hr_tensor = (imgs_hr + 1) / 2
         hr_tensor = hr_tensor.clamp(0, 1).float()
 
-        # 2. 计算当前 batch 的分数
+        # 计算当前 batch 的分数
         with torch.no_grad():
             # pyiqa 会返回这个 batch 的平均分 (scalar tensor)
             batch_psnr = psnr_metric(sr_tensor, hr_tensor)
             batch_ssim = ssim_metric(sr_tensor, hr_tensor)
             batch_lpips = lpips_metric(sr_tensor, hr_tensor)
 
-        # 3. 记录分数 (MetricLogger 会自动处理累加和平滑)
+        # 记录分数 (MetricLogger 会自动处理累加和平滑)
         metric_logger.update(psnr=batch_psnr.mean().item())
         metric_logger.update(ssim=batch_ssim.mean().item())
         metric_logger.update(lpips=batch_lpips.mean().item())
-        # 4. 保存图片 (调用辅助函数)
+        # 保存图片 (调用辅助函数)
         if misc.get_rank() == 0: # 只在主进程保存
             save_comparison_images(sampled_images, imgs_hr, imgs_lr, save_folder, i)
 
