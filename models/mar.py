@@ -7,6 +7,7 @@ import math
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
+import torch.nn.functional as F
 
 from timm.models.vision_transformer import Block, Mlp, DropPath
 
@@ -81,11 +82,18 @@ class RoPEAttention(nn.Module):
             k = k.transpose(1, 2)
         # ============================
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        dropout_p = self.attn_drop.p if self.training else 0.0
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        # 调用 SDPA
+        x = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,  # MAR 是双向 Attention，通常不需要 mask，除非你有特殊的 padding mask
+            dropout_p=dropout_p,
+            scale=self.scale # 如果不传，默认是 1/sqrt(head_dim)，和你原来的一样
+        )
+
+        # 调整输出形状 (SDPA 输出是 [B, H, N, D])
+        x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -127,6 +135,76 @@ def precompute_freqs_cis_2d(dim: int, coords_h, coords_w, theta: float = 10000.0
     # 拼接 H 和 W 的编码 -> [L, dim//2] (complex)
     freqs_cis = torch.cat([freqs_cis_h, freqs_cis_w], dim=1) 
     return freqs_cis
+
+def get_1d_sincos_pos_embed_from_grid_torch(embed_dim, pos):
+    """
+    pos: [N] tensor
+    """
+    assert embed_dim % 2 == 0
+    omega = torch.arange(embed_dim // 2, dtype=torch.float, device=pos.device)
+    omega /= embed_dim / 2.
+    omega = 1. / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (N,)
+    out = torch.einsum('m,d->md', pos, omega)  # (N, D/2)
+
+    emb_sin = torch.sin(out)
+    emb_cos = torch.cos(out)
+
+    emb = torch.cat([emb_sin, emb_cos], dim=1)  # (N, D)
+    return emb
+
+def get_2d_sincos_pos_embed_from_grid_torch(embed_dim, grid):
+    """
+    grid: [2, H, W]
+    """
+    assert embed_dim % 2 == 0
+    # 前一半维度编码 H (y轴)，后一半维度编码 W (x轴)
+    emb_h = get_1d_sincos_pos_embed_from_grid_torch(embed_dim // 2, grid[0].flatten())
+    emb_w = get_1d_sincos_pos_embed_from_grid_torch(embed_dim // 2, grid[1].flatten())
+    
+    emb = torch.cat([emb_h, emb_w], dim=1) # (H*W, D)
+    return emb
+
+def get_2d_sincos_pos_embed_torch(embed_dim, grid_size_hr, grid_size_lr, device, base_size=16):
+    """
+    生成 2D 绝对位置编码，支持任意分辨率归一化。
+    
+    Args:
+        embed_dim: 输出维度
+        grid_size_hr: tuple (h_hr, w_hr) -> HR 特征图的 (高, 宽)
+        grid_size_lr: tuple (h_lr, w_lr) -> LR 特征图的 (高, 宽)
+        device: 设备
+        base_size: 归一化基准大小 (建议设为训练时 token 的默认边长，如 16)
+    """
+    h_hr, w_hr = grid_size_hr
+    h_lr, w_lr = grid_size_lr
+    
+    # === 归一化坐标系 ===
+    # 逻辑：(坐标 + 0.5) / 当前边长 * 基准边长
+    # 效果：无论分辨率由多大，都被映射到 [0, base_size] 的连续空间
+    
+    # 1. 生成 HR 网格 (Pixel Center Alignment)
+    grid_h = (torch.arange(h_hr, dtype=torch.float, device=device) + 0.5) / h_hr * base_size
+    grid_w = (torch.arange(w_hr, dtype=torch.float, device=device) + 0.5) / w_hr * base_size
+    grid_x, grid_y = torch.meshgrid(grid_w, grid_h, indexing='xy')
+    grid_hr = torch.stack([grid_y, grid_x], dim=0) # [2, H, W]
+
+    # 2. 生成 LR 网格
+    # LR 网格在同一空间下的坐标。
+    # 只要 HR 和 LR 覆盖相同的物理视野（FOV），这种归一化就能保证它们空间对齐。
+    grid_l_h = (torch.arange(h_lr, dtype=torch.float, device=device) + 0.5) / h_lr * base_size
+    grid_l_w = (torch.arange(w_lr, dtype=torch.float, device=device) + 0.5) / w_lr * base_size
+    grid_lx, grid_ly = torch.meshgrid(grid_l_w, grid_l_h, indexing='xy')
+    grid_lr = torch.stack([grid_ly, grid_lx], dim=0) # [2, h_lr, w_lr]
+
+    # 3. 计算 Sin/Cos 编码 (调用原有函数)
+    pos_embed_hr = get_2d_sincos_pos_embed_from_grid_torch(embed_dim, grid_hr)
+    pos_embed_lr = get_2d_sincos_pos_embed_from_grid_torch(embed_dim, grid_lr)
+
+    # 4. 拼接 (Buffer/LR 在前)
+    pos_embed = torch.cat([pos_embed_lr, pos_embed_hr], dim=0).unsqueeze(0)
+    return pos_embed
 
 def mask_by_order(mask_len, order, bsz, seq_len):
     masking = torch.zeros(bsz, seq_len).cuda()
@@ -374,7 +452,7 @@ class MAR(nn.Module):
         # 构造 Mask (LR 永远可见)
         num_lr_tokens = shape_lr[0] * shape_lr[1]
         mask_with_buffer = torch.cat([torch.zeros(bsz, num_lr_tokens, device=x.device), mask], dim=1)
-        
+
         x = self.z_proj_ln(x)
 
         # Dropping (同时筛选 Feature 和 频率)
@@ -437,9 +515,19 @@ class MAR(nn.Module):
         # 移除 Buffer (LR tokens)
         x = x[:, num_lr_tokens:]
 
-        return x
+        # [修正] 必须为 DiffLoss 加回绝对位置编码！
+        # 这里需要调用你之前删掉的 get_2d_sincos_pos_embed_torch 函数
+        # 使用 self.seq_h 作为 base_size 保持一致性
+        pos_embed = get_2d_sincos_pos_embed_torch(
+            self.decoder_embed.out_features, shape_hr, shape_lr, x.device, base_size=self.seq_h
+        )
+        # 只取 HR 部分的位置编码
+        pos_embed_hr_only = pos_embed[:, num_lr_tokens:, :]
+        # 将位置编码扩展到当前的 Batch Size
+        pos_embed_hr_only = pos_embed_hr_only.expand(bsz, -1, -1)
+        return x, pos_embed_hr_only
 
-    def forward_loss(self, z, target, mask):
+    def forward_loss(self, z, pos_embed, target, mask):
         # z: Decoder 预测出的 Latent 特征 [Batch, Seq_Len, Dim]
         # target: 真实的 Latent 特征 (Ground Truth) [Batch, Seq_Len, Dim]
         # mask: 当前的遮挡掩码 [Batch, Seq_Len]  
@@ -449,18 +537,17 @@ class MAR(nn.Module):
         loss_mse_token = loss_mse_element.mean(dim=-1)
 
         loss_mse = (loss_mse_token * mask).sum() / (mask.sum() + 1e-6)
-
+        z_for_diff = z + pos_embed
         bsz, seq_len, _ = target.shape
 
         # 每一张图片在一次 Forward 中同时学习 4 个不同的扩散时间步（diffusion_batch_mul）
         target_diff = target.reshape(bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)
-        z_diff = z.reshape(bsz*seq_len, -1).repeat(self.diffusion_batch_mul, 1)
+        
+        # 使用加了位置编码的 z_for_diff
+        z_diff = z_for_diff.reshape(bsz*seq_len, -1).repeat(self.diffusion_batch_mul, 1)
         mask_diff = mask.reshape(bsz*seq_len).repeat(self.diffusion_batch_mul)
 
-
-        # z 是条件 (Condition)，target 是要加噪的数据 (x_start)
         loss_diff = self.diffloss(z=z_diff, target=target_diff, mask=mask_diff)
-
         loss = loss_diff + self.mse_weight * loss_mse
         
         return loss
@@ -493,10 +580,10 @@ class MAR(nn.Module):
         # mae encoder
         x = self.forward_mae_encoder(hr_tokens, mask, lr_tokens, shape_hr, shape_lr)
         # mae decoder
-        z = self.forward_mae_decoder(x, mask, shape_hr, shape_lr)
+        z, pos_embed  = self.forward_mae_decoder(x, mask, shape_hr, shape_lr)
 
         # diffloss
-        loss = self.forward_loss(z=z, target=gt_latents, mask=mask)
+        loss = self.forward_loss(z=z, pos_embed=pos_embed, target=gt_latents, mask=mask)
 
         return loss
 
@@ -554,7 +641,7 @@ class MAR(nn.Module):
             x = self.forward_mae_encoder(tokens, mask, lr_tokens, shape_hr, shape_lr)
             
             # mae decoder
-            z = self.forward_mae_decoder(x, mask, shape_hr, shape_lr)
+            z, pos_embed = self.forward_mae_decoder(x, mask, shape_hr, shape_lr)
 
             # mask ratio for the next round, following MaskGIT and MAGE.
             mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
@@ -575,10 +662,14 @@ class MAR(nn.Module):
             if not cfg == 1.0:
                 mask_to_pred = torch.cat([mask_to_pred, mask_to_pred], dim=0)
 
-            # sample token latents for this step
-            z = z[mask_to_pred.nonzero(as_tuple=True)]
-            ##469-479为测试时注释掉的部分，需要恢复，480,481需要删除
 
+            # sample token latents for this step
+            indices_to_pred = mask_to_pred.nonzero(as_tuple=True)
+            
+            z_sub = z[indices_to_pred]
+            pos_sub = pos_embed[indices_to_pred]
+            z_cond = z_sub + pos_sub
+            
             # cfg schedule follow Muse
             if cfg_schedule == "linear":
                 cfg_iter = 1 + (cfg - 1) * (num_hr_tokens - mask_len[0]) / num_hr_tokens
@@ -586,7 +677,8 @@ class MAR(nn.Module):
                 cfg_iter = cfg
             else:
                 raise NotImplementedError
-            sampled_token_latent = self.diffloss.sample(z, temperature, cfg_iter)
+            sampled_token_latent = self.diffloss.sample(z_cond, temperature, cfg_iter)
+
             if not cfg == 1.0:
                 sampled_token_latent, _ = sampled_token_latent.chunk(2, dim=0)  # Remove null class samples
                 mask_to_pred, _ = mask_to_pred.chunk(2, dim=0)
