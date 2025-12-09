@@ -170,12 +170,15 @@ def main(args):
     else:
         log_writer = None
  
-    # [修正] 数据集加载逻辑重构
+    # 1. 初始化变量
     dataset_train = None
     data_loader_train = None
     sampler_train = None
+    
+    num_tasks = misc.get_world_size()
+    global_rank = misc.get_rank()
 
-    # 1. 只有在非评估模式下，才加载训练集
+    # 2. 训练集加载 (仅在非评估模式下执行)
     if not args.evaluate:
         if args.use_cached:
             raise NotImplementedError("Cached mode needs update for SRDataset")
@@ -190,7 +193,7 @@ def main(args):
             )
             print(dataset_train)
 
-            # 初始化 Sampler (移到这里，确保 dataset_train 存在)
+            # 初始化 Sampler
             if args.distributed:
                 sampler_train = torch.utils.data.DistributedSampler(
                     dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
@@ -208,18 +211,30 @@ def main(args):
                 drop_last=True,
             )
 
-    # 2. 加载验证集/测试集
+    # 3. 验证集/测试集加载 (核心修改部分)
+    # 这里的 import 放在这里是为了防止在没有该文件时影响训练
+    from dataset.dataset_paired import PairedSRDataset, HROnlyDataset 
+
     if getattr(args, 'paired_test', False) and getattr(args, 'lr_data_path', None) is not None:
-        # 成对测试模式
+        # [模式 A] 成对测试 (HR + LR)
         print(f"Loading Paired Test Dataset from {args.hr_data_path} and {args.lr_data_path}")
-        from dataset.dataset_paired import PairedSRDataset
         dataset_val = PairedSRDataset(
             root_hr=args.hr_data_path, 
             root_lr=args.lr_data_path, 
             img_size=args.img_size
         )
+    
+    elif args.evaluate:
+        # [模式 B] 纯 HR 测试 (自动退化，读取扁平文件夹)
+        # 这就是解决你 FileNotFoundError 的关键
+        print(f"Loading HR-Only Test Dataset from {args.hr_data_path} (Flat Folder)")
+        dataset_val = HROnlyDataset(
+            root_hr=args.hr_data_path,
+            img_size=args.img_size
+        )
+        
     else:
-        # 默认验证模式
+        # [模式 C] 训练时的验证 (需要标准 ImageFolder 结构)
         if args.val_data_path is not None:
             val_root = args.val_data_path
         else:
@@ -241,6 +256,7 @@ def main(args):
     else:
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
+    # 验证集 DataLoader
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val, sampler=sampler_val,
         batch_size=args.eval_bsz,

@@ -35,8 +35,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --img_size 512 \
     --multi_scale \
     --lr_schedule cosine \
-    --resume output_sr_train_diffusionloss_codeformer_RoPE_3 \
     --online_eval
     #--grad_checkpointing \
-    #--resume output_sr_train_diffusionloss_codeformer_RoPE \
+    #--resume output_sr_train_diffusionloss_codeformer_RoPE_3 \
     

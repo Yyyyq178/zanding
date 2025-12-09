@@ -30,7 +30,7 @@ class CodeFormerDegradation:
         kernel_prob=(0.5, 0.5, 0.25, 0.25),
         blur_sigma=(0.1, 12),
         downsample_range=(1, 12),
-        noise_range=(0, 15/255.0),
+        noise_range=(0, 15),
         jpeg_range=(30, 100),
     ):
         self.blur_kernel_size = blur_kernel_size
