@@ -31,3 +31,4 @@ test_lr_images/
 results_continuous_1/
 preprocess_swinir.py
 dataset_paired.py
+CelebA-Test-3000/

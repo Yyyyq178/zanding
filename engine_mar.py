@@ -168,7 +168,7 @@ def train_one_epoch(model, vae,
 
 
 def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log_writer=None, cfg=1.0,
-             use_ema=True, data_loader=None, swinir_model=None):
+             use_ema=True, data_loader=None, swinir_model=None, paired_mode=False):
     torch.cuda.empty_cache()
     model_without_ddp.eval()
     save_folder = os.path.join(args.output_dir, "ariter{}-diffsteps{}-temp{}-{}cfg{}-image_num{}".format(args.num_iter,
@@ -213,7 +213,9 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
     # 使用 misc.MetricLogger 来自动管理所有 GPU 上的平均分计算
     metric_logger = misc.MetricLogger(delimiter="  ")
     # -------------------------------------------
-    degradation_model = CodeFormerDegradation()
+    if not paired_mode:
+        degradation_model = CodeFormerDegradation()
+
     print(f"Start evaluation on {len(data_loader)} batches...")
     
     # 开始遍历验证集 (HR, LR)
@@ -223,14 +225,15 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
 
         # 准备数据
         imgs_hr = imgs_hr.cuda(args.device, non_blocking=True)
+        imgs_lr = imgs_lr.cuda(args.device, non_blocking=True)
         #imgs_lr = imgs_lr.cuda(non_blocking=True)
         #imgs_lr = imgs_lr.cuda(args.device, non_blocking=True)
         # 为了节省时间，只跑前 5 个 batch 看效果
         if i >= 5: 
             print("Finished 5 batches preview, stopping evaluation.")
             break 
-
-        imgs_lr = degradation_model(imgs_hr, scale=4.0)
+        if not paired_mode:
+            imgs_lr = degradation_model(imgs_hr, scale=4.0)
         
         # # SwinIR 预处理（一次一张图片）
         # if swinir_model is not None:

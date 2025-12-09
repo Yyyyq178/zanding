@@ -102,6 +102,10 @@ def get_args_parser():
     # Dataset parameters
     parser.add_argument('--hr_data_path', default=None, type=str,
                         help='dataset path for High Resolution images')
+    parser.add_argument('--lr_data_path', default=None, type=str,
+                    help='dataset path for Low Resolution images (for paired testing)')
+    parser.add_argument('--paired_test', action='store_true',
+                    help='Use paired HR/LR dataset for evaluation')
     parser.add_argument('--val_data_path', default=None, type=str,
                         help='dataset path for validation (optional). If None, use hr_data_path/val')
     parser.add_argument('--steps_per_epoch', default=-1, type=int,
@@ -159,29 +163,66 @@ def main(args):
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
 
+    # [修正] 提前初始化 Log Writer，确保全局可用
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.log_dir)
     else:
         log_writer = None
  
-    if args.use_cached:
-        raise NotImplementedError("Cached mode needs update for SRDataset")
+    # [修正] 数据集加载逻辑重构
+    dataset_train = None
+    data_loader_train = None
+    sampler_train = None
+
+    # 1. 只有在非评估模式下，才加载训练集
+    if not args.evaluate:
+        if args.use_cached:
+            raise NotImplementedError("Cached mode needs update for SRDataset")
+        else:
+            print(f"Loading Training Dataset from {args.hr_data_path}")
+            dataset_train = SRDataset(
+                root=args.hr_data_path, 
+                hr_size=args.img_size,
+                lr_size=args.img_size // 2,
+                is_train=True, 
+                degradation_type=args.degradation
+            )
+            print(dataset_train)
+
+            # 初始化 Sampler (移到这里，确保 dataset_train 存在)
+            if args.distributed:
+                sampler_train = torch.utils.data.DistributedSampler(
+                    dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+                )
+            else:
+                sampler_train = torch.utils.data.RandomSampler(dataset_train)
+            print("Sampler_train = %s" % str(sampler_train))
+
+            # 初始化 DataLoader
+            data_loader_train = torch.utils.data.DataLoader(
+                dataset_train, sampler=sampler_train,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                pin_memory=args.pin_mem,
+                drop_last=True,
+            )
+
+    # 2. 加载验证集/测试集
+    if getattr(args, 'paired_test', False) and getattr(args, 'lr_data_path', None) is not None:
+        # 成对测试模式
+        print(f"Loading Paired Test Dataset from {args.hr_data_path} and {args.lr_data_path}")
+        from dataset.dataset_paired import PairedSRDataset
+        dataset_val = PairedSRDataset(
+            root_hr=args.hr_data_path, 
+            root_lr=args.lr_data_path, 
+            img_size=args.img_size
+        )
     else:
-        # 定义训练集: 开启随机裁剪 (is_train=True)
-        # hr_size=128, lr_size=32 (根据你的需求)
-        dataset_train = SRDataset(
-        root=args.hr_data_path, 
-        hr_size=args.img_size,
-        lr_size=args.img_size // 2,
-        is_train=True, 
-        degradation_type=args.degradation
-    )
-        # 定义验证集
+        # 默认验证模式
         if args.val_data_path is not None:
             val_root = args.val_data_path
         else:
-        # 如果没指定单独验证集，就直接用训练集路径 (全量评估)
             val_root = args.hr_data_path 
 
         dataset_val = SRDataset(
@@ -191,29 +232,23 @@ def main(args):
             is_train=False
         )
 
-    print(dataset_train)
-
-    sampler_train = torch.utils.data.DistributedSampler(
-        dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-    )
-    print("Sampler_train = %s" % str(sampler_train))
-
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=True,
-    )
+    # 验证集 Sampler
+    if args.distributed:
+        if len(dataset_val) % num_tasks != 0:
+            print('Warning: Enabling distributed evaluation with an eval dataset not divisible by num_tasks.')
+        sampler_val = torch.utils.data.DistributedSampler(
+            dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
+    else:
+        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
     data_loader_val = torch.utils.data.DataLoader(
-        dataset_val, sampler=None,
-        batch_size=args.eval_bsz, # 使用评估专用的 batch size
+        dataset_val, sampler=sampler_val,
+        batch_size=args.eval_bsz,
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=False
     )
-    # define the vae and mar model
+# define the vae and mar model
     vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).cuda().eval()
     for param in vae.parameters():
         param.requires_grad = False
@@ -335,7 +370,7 @@ def main(args):
         ema_params = [ema_state_dict[name].cuda() for name, _ in model_without_ddp.named_parameters()]
         print("Resume checkpoint %s" % args.resume)
 
-        if 'optimizer' in checkpoint and 'epoch' in checkpoint:
+        if 'optimizer' in checkpoint and 'epoch' in checkpoint and not args.evaluate:
             optimizer.load_state_dict(checkpoint['optimizer'])
             args.start_epoch = checkpoint['epoch'] + 1
             if 'scaler' in checkpoint:
@@ -351,7 +386,7 @@ def main(args):
     if args.evaluate:
         torch.cuda.empty_cache()
         evaluate(model_without_ddp, vae, ema_params, args, 0, batch_size=args.eval_bsz, log_writer=log_writer,
-                 cfg=args.cfg, use_ema=True, data_loader=data_loader_val)
+                 cfg=args.cfg, use_ema=True, data_loader=data_loader_val, paired_mode=args.paired_test)
         return
 
     # training
