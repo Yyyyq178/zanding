@@ -19,7 +19,7 @@ from dataset.dataset_sr import SRDataset
 from models.vae import AutoencoderKL
 from models import mar
 from engine_mar import train_one_epoch, evaluate
-#from models.swinir import SwinIR
+from models.swinir import SwinIR
 import copy
 
 
@@ -28,8 +28,12 @@ def get_args_parser():
     parser.add_argument('--batch_size', default=16, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * # gpus')
     parser.add_argument('--epochs', default=400, type=int)
-    parser.add_argument('--degradation', default='codeformer', type=str, 
+    parser.add_argument('--degradation', default='codeformer', type=str,
                     help='Degradation type: codeformer or realesrgan')
+    parser.add_argument('--use_swinir', action='store_true', help='Clean CodeFormer LR images with SwinIR')
+    parser.add_argument('--swinir_ckpt', default='pretrained_models/swinir/face_full_v1.ckpt', type=str,
+                        help='Path to SwinIR checkpoint used for LR preprocessing')
+    parser.add_argument('--swinir_batch', type=int, default=4, help='Mini-batch size for SwinIR inference')
     # Model parameters
     parser.add_argument('--model', default='mar_large', type=str, metavar='MODEL',
                         help='Name of model to train')
@@ -269,67 +273,55 @@ def main(args):
     for param in vae.parameters():
         param.requires_grad = False
 
-    # # ================= 初始化 SwinIR =================
-    # print("Initializing SwinIR for LR preprocessing...")
-    
-    # # 初始化 SwinIR 模型结构
-    # swinir_model = SwinIR(
-    #     img_size=64, 
-    #     patch_size=1, 
-    #     in_chans=3,
-    #     embed_dim=180, 
-    #     depths=[6, 6, 6, 6, 6, 6], 
-    #     num_heads=[6, 6, 6, 6, 6, 6],
-    #     window_size=8, 
-    #     mlp_ratio=2., 
-    #     sf=1,  # <--- 关键参数：必须与权重文件名的倍数一致 (x4)
-    #     img_range=1., 
-    #     upsampler='', 
-    #     resi_connection='1conv'
-    # )
+    swinir_model = None
+    if args.use_swinir:
+        print("Initializing SwinIR for LR preprocessing...")
+        swinir_model = SwinIR(
+            img_size=args.img_size,
+            patch_size=1,
+            in_chans=3,
+            embed_dim=180,
+            depths=[6, 6, 6, 6, 6, 6],
+            num_heads=[6, 6, 6, 6, 6, 6],
+            window_size=8,
+            mlp_ratio=2.,
+            sf=1,
+            img_range=1.,
+            upsampler='',
+            resi_connection='1conv'
+        )
 
-    # swinir_model.mean = torch.zeros(1, 3, 1, 1)
-    # # 定义权重路径 (请确认这个路径下真的有文件)
-    # swinir_path = "pretrained_models/swinir/face_full_v1.ckpt"
-    
-    # if os.path.exists(swinir_path):
-    #     print(f"Loading SwinIR weights from: {swinir_path}")
-    #     # 加载 checkpoint (使用 cpu 映射防止 OOM)
-    #     checkpoint = torch.load(swinir_path, map_location='cpu')
+        swinir_model.mean = torch.zeros(1, 3, 1, 1)
+        if os.path.exists(args.swinir_ckpt):
+            print(f"Loading SwinIR weights from: {args.swinir_ckpt}")
+            checkpoint = torch.load(args.swinir_ckpt, map_location='cpu')
 
-    #     # 提取参数字典 (适配 .ckpt 格式)
-    #     if 'state_dict' in checkpoint:
-    #         pretrained_dict = checkpoint['state_dict']
-    #     elif 'params_ema' in checkpoint:
-    #         pretrained_dict = checkpoint['params_ema']
-    #     elif 'params' in checkpoint:
-    #         pretrained_dict = checkpoint['params']
-    #     else:
-    #         pretrained_dict = checkpoint 
+            if 'state_dict' in checkpoint:
+                pretrained_dict = checkpoint['state_dict']
+            elif 'params_ema' in checkpoint:
+                pretrained_dict = checkpoint['params_ema']
+            elif 'params' in checkpoint:
+                pretrained_dict = checkpoint['params']
+            else:
+                pretrained_dict = checkpoint
 
-    #     # 智能过滤参数数
-    #     model_dict = swinir_model.state_dict()
-    #     valid_dict = {}
-    #     for k, v in pretrained_dict.items():
-    #         if k in model_dict:
-    #             if v.shape == model_dict[k].shape:
-    #                 valid_dict[k] = v
-    #             else:
-    #                 print(f"⚠️ Skipping shape mismatch: {k} (ckpt: {v.shape}, model: {model_dict[k].shape})")
-    #         # else: 忽略多余的键 (如 lpips_metric)
+            model_dict = swinir_model.state_dict()
+            valid_dict = {}
+            for k, v in pretrained_dict.items():
+                if k in model_dict and v.shape == model_dict[k].shape:
+                    valid_dict[k] = v
+                elif k in model_dict:
+                    print(f"⚠️ Skipping shape mismatch: {k} (ckpt: {v.shape}, model: {model_dict[k].shape})")
 
-    #     # 4. 加载参数 (strict=False 是关键，允许忽略多余的键)
-    #     swinir_model.load_state_dict(valid_dict, strict=False)
-    #     print(f"Successfully loaded {len(valid_dict)} keys for SwinIR.")
-    # else:
-    #     print(f"Warning: SwinIR weight not found at {swinir_path}. Using random init (NOT RECOMMENDED).")
+            swinir_model.load_state_dict(valid_dict, strict=False)
+            print(f"Successfully loaded {len(valid_dict)} keys for SwinIR.")
+        else:
+            print(f"Warning: SwinIR weight not found at {args.swinir_ckpt}. Using random init (NOT RECOMMENDED).")
 
-    # # 移动到 GPU 并冻结参数 (不参与训练)
-    # swinir_model.eval()
-    # swinir_model.to(device)
-    # for param in swinir_model.parameters():
-    #     param.requires_grad = False
-    # # ===========================================================
+        swinir_model.eval()
+        swinir_model.to(device)
+        for param in swinir_model.parameters():
+            param.requires_grad = False
     
     model = mar.__dict__[args.model](
         img_size=args.img_size,
@@ -402,7 +394,8 @@ def main(args):
     if args.evaluate:
         torch.cuda.empty_cache()
         evaluate(model_without_ddp, vae, ema_params, args, 0, batch_size=args.eval_bsz, log_writer=log_writer,
-                 cfg=args.cfg, use_ema=True, data_loader=data_loader_val, paired_mode=args.paired_test)
+                 cfg=args.cfg, use_ema=True, data_loader=data_loader_val, paired_mode=args.paired_test,
+                 swinir_model=swinir_model)
         return
 
     # training
@@ -418,8 +411,8 @@ def main(args):
             data_loader_train,
             optimizer, device, epoch, loss_scaler,
             log_writer=log_writer,
-            args=args, 
-            #swinir_model=swinir_model
+            args=args,
+            swinir_model=swinir_model
         )
 
         # save checkpoint
@@ -432,11 +425,11 @@ def main(args):
             torch.cuda.empty_cache()
             evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=args.eval_bsz, log_writer=log_writer,
                      cfg=1.0, use_ema=True, data_loader=data_loader_val
-                     #, swinir_model=swinir_model
+                     , swinir_model=swinir_model
                      )
             if not (args.cfg == 1.0 or args.cfg == 0.0):
                 evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=args.eval_bsz // 2,
-                         log_writer=log_writer, cfg=args.cfg, use_ema=True)
+                         log_writer=log_writer, cfg=args.cfg, use_ema=True, swinir_model=swinir_model)
             torch.cuda.empty_cache()
 
         if misc.is_main_process():
