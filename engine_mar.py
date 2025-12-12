@@ -71,7 +71,7 @@ def train_one_epoch(model, vae,
         samples_hr = samples_hr.to(device, non_blocking=True)
 
         # if args.multi_scale: 
-            # scale=None -> 随机 2-4 倍
+            # scale=None -> 随机 1-12 倍
         samples_lr = degradation_model(samples_hr, scale=None) 
         # else:
         #     # 固定 4 倍
@@ -233,7 +233,14 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
             print("Finished 5 batches preview, stopping evaluation.")
             break 
         if not paired_mode:
-            imgs_lr = degradation_model(imgs_hr, scale=4.0)
+            # 如果是单独运行测试脚本 (args.evaluate=True)，且不是在线验证 (args.online_eval=False)
+            # 或者你可以直接简单粗暴地判断：如果是测试模式，就用随机
+            if args.evaluate: 
+                # 测试模式：传入 None，激活 CodeFormer 内部的 (1, 12) 随机逻辑
+                imgs_lr = degradation_model(imgs_hr, scale=None) 
+            else:
+                # 训练验证模式：固定 4.0，保证指标稳定
+                imgs_lr = degradation_model(imgs_hr, scale=4.0)
         
         # # SwinIR 预处理（一次一张图片）
         # if swinir_model is not None:

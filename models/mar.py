@@ -231,7 +231,7 @@ class MAR(nn.Module):
                  num_sampling_steps='100',
                  diffusion_batch_mul=1,         #单卡最好设为1，之前为4
                  grad_checkpointing=False,
-                 mse_weight=0.5,
+                 mse_weight=0.2,
                  ):
         super().__init__()
 
