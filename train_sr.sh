@@ -29,6 +29,9 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --val_data_path /root/autodl-tmp/zanding/data \
     --output_dir output_sr_train_diffusionloss_codeformer_RoPE_3_1:5_swinir \
     --degradation codeformer \
+    --use_swinir \
+    --swinir_ckpt pretrained_models/swinir/face_swinir_v1.ckpt \
+    --swinir_batch 4 \
     --eval_freq 4 \
     --save_last_freq 2 \
     --eval_bsz 8 \
@@ -38,4 +41,3 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --online_eval
     #--grad_checkpointing \
     #--resume output_sr_train_diffusionloss_codeformer_RoPE_3 \
-    

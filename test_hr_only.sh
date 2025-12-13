@@ -22,4 +22,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --resume output_sr_train_diffusionloss_codeformer_RoPE_3_1:5 \
     --evaluate \
     --hr_data_path /root/autodl-tmp/zanding/CelebA-Test-3000/HQ \
+    --use_swinir \
+    --swinir_ckpt pretrained_models/swinir/face_swinir_v1.ckpt \
+    --swinir_batch 4 \
     --output_dir output_test_hr_only

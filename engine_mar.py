@@ -31,7 +31,6 @@ def update_ema(target_params, source_params, rate=0.99):
     for targ, src in zip(target_params, source_params):
         targ.detach().mul_(rate).add_(src, alpha=1 - rate)
 
-@torch.no_grad()
 def preprocess_with_swinir(lr_tensor, swinir_model, mini_batch_size=4):
     """Clean LR images with SwinIR and map values back to [-1, 1]."""
     if swinir_model is None:

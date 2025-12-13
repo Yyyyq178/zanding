@@ -277,21 +277,22 @@ def main(args):
     if args.use_swinir:
         print("Initializing SwinIR for LR preprocessing...")
         swinir_model = SwinIR(
-            img_size=args.img_size,
+            img_size=64,
             patch_size=1,
             in_chans=3,
             embed_dim=180,
-            depths=[6, 6, 6, 6, 6, 6],
-            num_heads=[6, 6, 6, 6, 6, 6],
+            depths=[6, 6, 6, 6, 6, 6, 6, 6],
+            num_heads=[6, 6, 6, 6, 6, 6, 6, 6],
             window_size=8,
-            mlp_ratio=2.,
-            sf=1,
-            img_range=1.,
-            upsampler='',
-            resi_connection='1conv'
+            mlp_ratio=2.0,
+            sf=8,
+            img_range=1.0,
+            upsampler="nearest+conv",
+            resi_connection="1conv",
+            unshuffle=True,
+            unshuffle_scale=8,
         )
 
-        swinir_model.mean = torch.zeros(1, 3, 1, 1)
         if os.path.exists(args.swinir_ckpt):
             print(f"Loading SwinIR weights from: {args.swinir_ckpt}")
             checkpoint = torch.load(args.swinir_ckpt, map_location='cpu')
@@ -307,16 +308,28 @@ def main(args):
 
             model_dict = swinir_model.state_dict()
             valid_dict = {}
-            for k, v in pretrained_dict.items():
-                if k in model_dict and v.shape == model_dict[k].shape:
-                    valid_dict[k] = v
-                elif k in model_dict:
-                    print(f"⚠️ Skipping shape mismatch: {k} (ckpt: {v.shape}, model: {model_dict[k].shape})")
 
-            swinir_model.load_state_dict(valid_dict, strict=False)
-            print(f"Successfully loaded {len(valid_dict)} keys for SwinIR.")
+            # === 核心修复：自动剥离 'module.' 前缀 ===
+            for k, v in pretrained_dict.items():
+                new_k = k
+                if k.startswith('module.'):
+                    new_k = k[7:]  # 去掉开头的 "module."
+                
+                if new_k in model_dict:
+                    if v.shape == model_dict[new_k].shape:
+                        valid_dict[new_k] = v
+                    else:
+                        print(f"⚠️ Shape mismatch: {new_k} (ckpt: {v.shape} vs model: {model_dict[new_k].shape})")
+            # ========================================
+
+            swinir_model.load_state_dict(valid_dict, strict=True) # 这里可以放心开 strict=True 了，或者保持 False
+            print(f"✅ Successfully loaded {len(valid_dict)} / {len(model_dict)} keys for SwinIR.")
+            
+            if len(valid_dict) == 0:
+                raise RuntimeError("❌ Error: Loaded 0 keys! Checkpoint matching failed.")
         else:
             print(f"Warning: SwinIR weight not found at {args.swinir_ckpt}. Using random init (NOT RECOMMENDED).")
+
 
         swinir_model.eval()
         swinir_model.to(device)

@@ -17,4 +17,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --paired_test \
     --hr_data_path /root/autodl-tmp/zanding/CelebA-Test-3000/HQ \
     --lr_data_path /root/autodl-tmp/zanding/CelebA-Test-3000/LQ \
+    --use_swinir \
+    --swinir_ckpt pretrained_models/swinir/face_swinir_v1.ckpt \
+    --swinir_batch 4 \
     --output_dir output_test_paired
