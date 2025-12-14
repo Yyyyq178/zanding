@@ -17,7 +17,7 @@ import os
 import copy
 import time
 
-# os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+#os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 def update_ema(target_params, source_params, rate=0.99):
     """
@@ -179,11 +179,34 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         return
     
     # --- 初始化评价指标 (加载模型到 GPU) ---
-    print("Loading metrics models (PSNR/SSIM/LPIPS)...")
+    print("Loading metrics models (PSNR/SSIM/LPIPS/FID/MUSIQ/BRISQUE/DISTS/MANIQA/CLIPIQA/MS-SSIM/NIQE/PIQE)...")
     # 这里的 device='cuda' 假设你一定用 GPU。LPIPS 计算较慢，如果不关心可以注释掉。
-    psnr_metric = pyiqa.create_metric('psnr', device='cuda')
-    ssim_metric = pyiqa.create_metric('ssim', device='cuda')
-    lpips_metric = pyiqa.create_metric('lpips', device='cuda') 
+    metric_specs = {
+        # 全参考 (需要 hr_tensor)
+        'psnr': ('psnr', True),
+        'ssim': ('ssim', True),
+        'lpips': ('lpips', True),
+        'dists': ('dists', True),
+        'ms_ssim': ('ms_ssim', True),
+        'musiq': ('musiq', False),
+        'brisque': ('brisque', False),
+        'maniqa': ('maniqa', False),
+        'clipiqa': ('clipiqa', False),
+        'niqe': ('niqe', False),
+        'piqe': ('piqe', False),
+    }
+
+    fid_metric = pyiqa.create_metric('fid', device='cuda')
+
+    full_ref_metrics = {}
+    no_ref_metrics = {}
+
+    for log_name, (metric_name, is_full_ref) in metric_specs.items():
+        metric = pyiqa.create_metric(metric_name, device='cuda')
+        if is_full_ref:
+            full_ref_metrics[log_name] = metric
+        else:
+            no_ref_metrics[log_name] = metric
     
     # 使用 misc.MetricLogger 来自动管理所有 GPU 上的平均分计算
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -191,18 +214,18 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
     if not paired_mode:
         degradation_model = CodeFormerDegradation()
 
+    sr_save_dir = os.path.join(save_folder, "sr_images")
+    hr_save_dir = os.path.join(save_folder, "hr_images")
+
     print(f"Start evaluation on {len(data_loader)} batches...")
     
     # 开始遍历验证集 (HR, LR)
     for i, (imgs_hr, imgs_lr, filenames) in enumerate(data_loader):
 
-        #torch.cuda.empty_cache()
-
         # 准备数据
         imgs_hr = imgs_hr.cuda(args.device, non_blocking=True)
         imgs_lr = imgs_lr.cuda(args.device, non_blocking=True)
-        #imgs_lr = imgs_lr.cuda(non_blocking=True)
-        #imgs_lr = imgs_lr.cuda(args.device, non_blocking=True)
+
         # 为了节省时间，只跑前 5 个 batch 看效果
         if i >= 5: 
             print("Finished 5 batches preview, stopping evaluation.")
@@ -256,21 +279,32 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         hr_tensor = hr_tensor.clamp(0, 1).float()
 
         # 计算当前 batch 的分数
+        batch_scores = {}
         with torch.no_grad():
             # pyiqa 会返回这个 batch 的平均分 (scalar tensor)
-            batch_psnr = psnr_metric(sr_tensor, hr_tensor)
-            batch_ssim = ssim_metric(sr_tensor, hr_tensor)
-            batch_lpips = lpips_metric(sr_tensor, hr_tensor)
+            for metric_name, metric in full_ref_metrics.items():
+                batch_scores[metric_name] = metric(sr_tensor, hr_tensor)
+
+            for metric_name, metric in no_ref_metrics.items():
+                batch_scores[metric_name] = metric(sr_tensor)
 
         # 记录分数 (MetricLogger 会自动处理累加和平滑)
-        metric_logger.update(psnr=batch_psnr.mean().item())
-        metric_logger.update(ssim=batch_ssim.mean().item())
-        metric_logger.update(lpips=batch_lpips.mean().item())
+        for metric_name, metric_value in batch_scores.items():
+            metric_logger.update(**{metric_name: metric_value.mean().item()})
+
+        # 保存 SR/HR 图片用于后续 FID 计算
+        save_sr_hr_images(sr_tensor, hr_tensor, filenames, sr_save_dir, hr_save_dir, i)
+
         # 保存图片 (调用辅助函数)
-        if misc.get_rank() == 0: # 只在主进程保存
+        if misc.get_rank() == 0:
             save_comparison_images(sampled_images, imgs_hr, imgs_lr, save_folder, i)
 
     torch.distributed.barrier()
+
+    fid_score = fid_metric(sr_save_dir, hr_save_dir)
+    fid_score_value = fid_score.item() if torch.is_tensor(fid_score) else float(fid_score)
+    fid_score_value = misc.all_reduce_mean(torch.tensor(fid_score_value, device=args.device)).item()
+    metric_logger.update(fid=fid_score_value)
     time.sleep(1)
 
     # back to no ema
@@ -278,7 +312,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         print("Switch back from ema")
         model_without_ddp.load_state_dict(model_state_dict)
 
-    # 1. 同步所有显卡的统计数据 (这一步非常重要，否则你看到的只有主卡的分数)
+    # 同步所有显卡的统计数据 (这一步非常重要，否则你看到的只有主卡的分数)
     metric_logger.synchronize_between_processes()
     
     print("Averaged Validation stats:", metric_logger)
@@ -288,14 +322,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         txt_path = os.path.join(save_folder, "metrics_results.txt")
         
         with open(txt_path, "a") as f:
-            # 构造单行日志字符串
-            # str(metric_logger) 会自动生成 "psnr: X (X)  ssim: X (X) ..." 的格式
-            log_str = f"Epoch {epoch}: {metric_logger}"
-            
-            # 如果计算了 FID，把它拼接到行尾
-            # if 'fid_score' in locals() and fid_score > 0:
-            #     log_str += f"  fid: {fid_score:.4f}"
-            
+            log_str = f"Epoch {epoch}: {metric_logger}"          
             f.write(log_str + "\n")
             
         print(f"Metrics appended to: {txt_path}")
@@ -303,12 +330,8 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
     # 2. 如果配置了 Tensorboard，写入验证集指标
     if log_writer is not None:
         # 注意：这里假设你在第二步中已经像 metric_logger.update(psnr=...) 那样添加了这些 key
-        if 'psnr' in metric_logger.meters:
-            log_writer.add_scalar('val/psnr', metric_logger.meters['psnr'].global_avg, epoch)
-        if 'ssim' in metric_logger.meters:
-            log_writer.add_scalar('val/ssim', metric_logger.meters['ssim'].global_avg, epoch)
-        if 'lpips' in metric_logger.meters:    
-            log_writer.add_scalar('val/lpips', metric_logger.meters['lpips'].global_avg, epoch)
+        for name, meter in metric_logger.meters.items():
+            log_writer.add_scalar(f'val/{name}', meter.global_avg, epoch)
     # 返回统计结果，方便外部调用
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
@@ -343,6 +366,37 @@ def cache_latents(vae,
             torch.cuda.synchronize()
 
     return
+def save_sr_hr_images(sr, hr, filenames, sr_dir, hr_dir, batch_idx):
+    os.makedirs(sr_dir, exist_ok=True)
+    os.makedirs(hr_dir, exist_ok=True)
+
+    def to_numpy(x):
+        #x = (x + 1) / 2
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0)
+        x = x.clamp(0, 1)
+        return (x * 255).byte().cpu().permute(0, 2, 3, 1).numpy()
+
+    sr_np = to_numpy(sr)
+    hr_np = to_numpy(hr)
+
+    rank = misc.get_rank()
+
+    for idx in range(sr_np.shape[0]):
+        base_name = None
+        if filenames is not None and len(filenames) > idx:
+            base_name = os.path.splitext(os.path.basename(str(filenames[idx])))[0]
+        if not base_name:
+            base_name = f"batch{batch_idx}_img{idx}"
+
+        prefix = f"rank{rank}_{base_name}"
+        sr_path = os.path.join(sr_dir, f"{prefix}.png")
+        hr_path = os.path.join(hr_dir, f"{prefix}.png")
+
+        sr_img = cv2.cvtColor(sr_np[idx], cv2.COLOR_RGB2BGR)
+        hr_img = cv2.cvtColor(hr_np[idx], cv2.COLOR_RGB2BGR)
+
+        cv2.imwrite(sr_path, sr_img)
+        cv2.imwrite(hr_path, hr_img)
 def save_comparison_images(sr, hr, lr, save_folder, batch_idx):
     # 辅助函数：把 Tensor 转为 numpy 图片
     def process(x):
