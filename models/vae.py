@@ -462,8 +462,31 @@ class AutoencoderKL(nn.Module):
             self.init_from_ckpt(ckpt_path)
 
     def init_from_ckpt(self, path):
-        sd = torch.load(path, map_location="cpu")["model"]
+        # 加载整个 checkpoint 字典
+        # weights_only=False 解决 PyTorch 2.6+ 的安全限制问题
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        
+        # 自动判断权重存储在哪个 key 下
+        if "state_dict" in ckpt:
+            sd = ckpt["state_dict"]
+            # PyTorch Lightning 可能会在 key 前面加 "model." 或 "autoencoder." 等前缀，通常需要去除
+            # 这里简单处理，如果发现 keys 不匹配，可能需要进一步处理 keys
+        elif "model" in ckpt:
+            sd = ckpt["model"]
+        else:
+            # 如果没有常见的 key，假设整个字典就是权重
+            sd = ckpt
+
+        # 加载权重到模型
+        # strict=False 允许加载时忽略一些不匹配的键（例如多余的 loss 统计量）
         msg = self.load_state_dict(sd, strict=False)
+        
+        print(f"Restored from {path}")
+        if len(msg.missing_keys) > 0:
+            print("Missing keys:", msg.missing_keys)
+        if len(msg.unexpected_keys) > 0:
+            print("Unexpected keys:", msg.unexpected_keys)
+
         print("Loading pre-trained KL-VAE")
         print("Missing keys:")
         print(msg.missing_keys)

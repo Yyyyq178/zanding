@@ -13,7 +13,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --model mar_base \
     --diffloss_d 6 \
     --diffloss_w 1024 \
-    --vae_path pretrained_models/vae/kl16.ckpt \
+    --vae_path pretrained_models/vae/kl-f16.ckpt \
     --buffer_size 64 \
     --vae_embed_dim 16 \
     --vae_stride 16 \
@@ -27,7 +27,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --blr 2.0e-2 \
     --hr_data_path /root/autodl-tmp/zanding/data \
     --val_data_path /root/autodl-tmp/zanding/data \
-    --output_dir output_sr_train_diffusionloss_codeformer_RoPE_3_1:5_swinir \
+    --output_dir output_sr_train_diffusionloss_codeformer_RoPE_3_1:5_swinir_kl-f16 \
     --degradation codeformer \
     --use_swinir \
     --swinir_ckpt pretrained_models/swinir/face_swinir_v1.ckpt \

@@ -199,6 +199,15 @@ def get_rank():
         return 0
     return dist.get_rank()
 
+def count_parameters(model):
+    """Return total and trainable parameter counts for a model."""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return {
+        "total": total_params,
+        "trainable": trainable_params,
+    }
+
 
 def is_main_process():
     return get_rank() == 0

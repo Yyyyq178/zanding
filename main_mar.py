@@ -270,6 +270,12 @@ def main(args):
     )
 # define the vae and mar model
     vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).cuda().eval()
+    vae_param_stats = misc.count_parameters(vae)
+    print("VAE total parameters: {:.2f}M".format(vae_param_stats["total"] / 1e6))
+    print("VAE trainable parameters: {:.2f}M".format(vae_param_stats["trainable"] / 1e6))
+    if log_writer is not None:
+        log_writer.add_scalar('params/vae_total_millions', vae_param_stats["total"] / 1e6, 0)
+        log_writer.add_scalar('params/vae_trainable_millions', vae_param_stats["trainable"] / 1e6, 0)
     for param in vae.parameters():
         param.requires_grad = False
 
@@ -357,8 +363,12 @@ def main(args):
 
     print("Model = %s" % str(model))
     # following timm: set wd as 0 for bias and norm layers
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print("Number of trainable parameters: {}M".format(n_params / 1e6))
+    param_stats = misc.count_parameters(model)
+    print("Total parameters: {:.2f}M".format(param_stats["total"] / 1e6))
+    print("Number of trainable parameters: {:.2f}M".format(param_stats["trainable"] / 1e6))
+    if log_writer is not None:
+        log_writer.add_scalar('params/total_millions', param_stats["total"] / 1e6, 0)
+        log_writer.add_scalar('params/trainable_millions', param_stats["trainable"] / 1e6, 0)
 
     model.to(device)
     model_without_ddp = model

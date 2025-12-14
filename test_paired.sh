@@ -12,7 +12,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --batch_size 1 \
     --eval_bsz 16 \
     --img_size 512 \
-    --resume output_sr_train_diffusionloss_codeformer_RoPE_3_1:5 \
+    --resume output_sr_train_diffusionloss_codeformer_RoPE_3_1:5_swinir \
     --evaluate \
     --paired_test \
     --hr_data_path /root/autodl-tmp/zanding/CelebA-Test-3000/HQ \
