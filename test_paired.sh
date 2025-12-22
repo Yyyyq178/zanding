@@ -10,7 +10,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --vae_stride 16 \
     --patch_size 1 \
     --batch_size 1 \
-    --eval_bsz 16 \
+    --eval_bsz 8 \
     --img_size 512 \
     --resume output_sr_train_diffusionloss_codeformer_RoPE_3_1:5_swinir_kl-f16 \
     --evaluate \

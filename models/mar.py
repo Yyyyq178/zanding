@@ -232,6 +232,8 @@ class MAR(nn.Module):
                  diffusion_batch_mul=1,         #单卡最好设为1，之前为4
                  grad_checkpointing=False,
                  mse_weight=0.2,
+                 use_deg_head=False,
+                 deg_use_sigmoid=True,
                  ):
         super().__init__()
 
@@ -247,6 +249,9 @@ class MAR(nn.Module):
         self.token_embed_dim = vae_embed_dim * patch_size**2
         self.grad_checkpointing = grad_checkpointing
         self.mse_weight = mse_weight
+        self.use_deg_head = use_deg_head
+        self.deg_use_sigmoid = deg_use_sigmoid
+
 
         # --------------------------------------------------------------------------
         # MAR variant masking ratio, a left-half truncated Gaussian centered at 100% masking ratio with std 0.25
@@ -308,8 +313,13 @@ class MAR(nn.Module):
             grad_checkpointing=grad_checkpointing
         )
         self.diffusion_batch_mul = diffusion_batch_mul
-
-        
+        if self.use_deg_head:
+            self.degradation_head = nn.Sequential(
+                norm_layer(decoder_embed_dim),
+                nn.Linear(decoder_embed_dim, decoder_embed_dim // 2),
+                nn.GELU(),
+                nn.Linear(decoder_embed_dim // 2, 1),
+            )
 
     def initialize_weights(self):
         # parameters
@@ -550,7 +560,7 @@ class MAR(nn.Module):
         loss_diff = self.diffloss(z=z_diff, target=target_diff, mask=mask_diff)
         loss = loss_diff + self.mse_weight * loss_mse
         
-        return loss
+        return loss, loss_diff, loss_mse
 
     def forward(self, x_hr, x_lr):
         # x_hr: HR Latents [B, 16, 16, 16]
@@ -582,12 +592,17 @@ class MAR(nn.Module):
         # mae decoder
         z, pos_embed  = self.forward_mae_decoder(x, mask, shape_hr, shape_lr)
 
-        # diffloss
-        loss = self.forward_loss(z=z, pos_embed=pos_embed, target=gt_latents, mask=mask)
-
-        return loss
-
-    def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", x_lr=None, temperature=1.0, progress=False, target_seq_len=None):
+        # loss
+        loss, loss_diff, loss_mse = self.forward_loss(z=z, pos_embed=pos_embed, target=gt_latents, mask=mask)
+        if self.use_deg_head:
+            d_tok_pred = self.degradation_head(z).squeeze(-1)
+            if self.deg_use_sigmoid:
+                d_tok_pred = torch.sigmoid(d_tok_pred)
+            assert d_tok_pred.shape[1] == gt_latents.shape[1], "D_tok_pred shape mismatch with token count."
+            return loss, loss_diff, loss_mse, d_tok_pred
+        
+        return loss, loss_diff, loss_mse
+    def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", x_lr=None, temperature=1.0, progress=False, target_seq_len=None, curriculum_decode=False):
         #num_iter：自回归迭代次数（官方推荐设置256）
         # 必须有 LR 输入
         if x_lr is None:
@@ -603,15 +618,26 @@ class MAR(nn.Module):
         mask = torch.ones(bsz, num_hr_tokens).cuda()
         # 初始化 Token：全为 0 (画布是黑的)
         tokens = torch.zeros(bsz, num_hr_tokens, self.token_embed_dim).cuda()
-        # 生成随机顺序：决定先画哪儿，后画哪儿
+        # 生成顺序：决定先画哪儿，后画哪儿
         #orders = self.sample_orders(bsz)
-
-        # 直接调用修改后的 sample_orders，不用手写循环了
-        orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
+        if curriculum_decode:
+            if not self.use_deg_head:
+                raise ValueError("curriculum_decode requires use_deg_head=True.")
+            with torch.no_grad():
+                x_full = self.forward_mae_encoder(tokens, mask, lr_tokens, shape_hr, shape_lr)
+                z_full, _ = self.forward_mae_decoder(x_full, mask, shape_hr, shape_lr)
+            d_tok_pred = self.degradation_head(z_full).squeeze(-1)
+            if self.deg_use_sigmoid:
+                d_tok_pred = torch.sigmoid(d_tok_pred)
+            assert d_tok_pred.shape[1] == num_hr_tokens, "D_tok_pred shape mismatch with token count."
+            orders = torch.argsort(d_tok_pred, dim=-1)
+        else:
+            orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
 
         indices = list(range(num_iter))
         if progress:
             indices = tqdm(indices)
+        prev_mask_len = None
         # generate latents
         for step in indices:
             cur_tokens = tokens.clone()
@@ -629,11 +655,14 @@ class MAR(nn.Module):
             # masks out at least one for the next iteration
             mask_len = torch.maximum(torch.Tensor([1]).cuda(),
                                      torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len))
-
+            if prev_mask_len is not None:
+                assert mask_len[0] <= prev_mask_len + 1e-6, "Mask length must be non-increasing."
+            prev_mask_len = mask_len[0]
             # get masking for next iteration and locations to be predicted in this iteration
-            mask_next = mask_by_order(mask_len[0], orders, bsz, num_hr_tokens) 
+            mask_next = mask_by_order(mask_len[0], orders, bsz, num_hr_tokens)
             if step >= num_iter - 1:
                 mask_to_pred = mask[:bsz].bool()
+                mask_next = torch.zeros_like(mask)
             else:
                 mask_to_pred = torch.logical_xor(mask[:bsz].bool(), mask_next.bool())
             mask = mask_next

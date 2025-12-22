@@ -27,11 +27,10 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --blr 2.0e-2 \
     --hr_data_path /root/autodl-tmp/zanding/data \
     --val_data_path /root/autodl-tmp/zanding/data \
-    --output_dir output_sr_train_diffusionloss_codeformer_RoPE_3_1:5_swinir_kl-f16 \
+    --output_dir output_sr_train_10:2:1 \
     --degradation codeformer \
-    --use_swinir \
-    --swinir_ckpt pretrained_models/swinir/face_swinir_v1.ckpt \
-    --swinir_batch 4 \
+    --use_deg_head \
+    --deg_use_sigmoid \
     --eval_freq 4 \
     --save_last_freq 2 \
     --eval_bsz 8 \

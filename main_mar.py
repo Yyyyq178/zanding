@@ -100,9 +100,16 @@ def get_args_parser():
     parser.add_argument('--num_sampling_steps', type=str, default="ddim100")
     parser.add_argument('--diffusion_batch_mul', type=int, default=1)
     parser.add_argument('--temperature', default=1.0, type=float, help='diffusion loss sampling temperature')
-    # MSE 损失权重，默认为 1.0 (你可以根据效果调整，如 0.5 或 0.1)
+    # MSE 损失权重，默认为 0.2
     parser.add_argument('--mse_weight', default=0.2, type=float, help='Weight for MSE loss')
-
+    # Degradation head params
+    parser.add_argument('--use_deg_head', action='store_true', help='Enable degradation prediction head')
+    parser.add_argument('--lambda_deg', default=0.8, type=float, help='Weight for degradation loss')
+    parser.add_argument('--deg_w_pix', default=1.0, type=float, help='Weight for pixel residual term')
+    parser.add_argument('--deg_w_grad', default=1.0, type=float, help='Weight for Sobel gradient term')
+    parser.add_argument('--deg_use_sigmoid', action='store_true', help='Apply sigmoid to degradation head output')
+    parser.add_argument('--curriculum_decode', action='store_true', help='Enable hard-order curriculum decoding')
+    parser.add_argument('--decode_steps', default=None, type=int, help='Override decoding steps for curriculum')
     # Dataset parameters
     parser.add_argument('--hr_data_path', default=None, type=str,
                         help='dataset path for High Resolution images')
@@ -359,6 +366,8 @@ def main(args):
         diffusion_batch_mul=args.diffusion_batch_mul,
         grad_checkpointing=args.grad_checkpointing,
         mse_weight=args.mse_weight,
+        use_deg_head=args.use_deg_head,
+        deg_use_sigmoid=args.deg_use_sigmoid,
     )
 
     print("Model = %s" % str(model))

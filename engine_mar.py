@@ -9,6 +9,7 @@ import util.lr_sched as lr_sched
 import torch.nn.functional as F
 from models.vae import DiagonalGaussianDistribution
 from dataset.codeformer import CodeFormerDegradation
+from util.deg_utils import build_degradation_map, pool_degradation_to_tokens
 import pyiqa
 import shutil
 import cv2
@@ -107,7 +108,20 @@ def train_one_epoch(model, vae,
         # forward
         with torch.amp.autocast('cuda'):
             # 传入模型
-            loss = model(x_hr, x_lr)
+            model_out = model(x_hr, x_lr)
+            if args.use_deg_head:
+                loss, loss_diff, loss_mse, d_tok_pred = model_out
+            else:
+                loss, loss_diff, loss_mse = model_out
+                d_tok_pred = None
+
+            if args.use_deg_head:
+                d_pix_gt = build_degradation_map(samples_hr, samples_lr, args.deg_w_pix, args.deg_w_grad)
+                d_tok_gt = pool_degradation_to_tokens(d_pix_gt, model)
+                assert d_tok_pred is not None, "D_tok_pred must be returned when use_deg_head is enabled."
+                assert d_tok_pred.shape == d_tok_gt.shape, "D_tok_gt must align with D_tok_pred."
+                loss_deg = F.l1_loss(d_tok_pred, d_tok_gt)
+                loss = loss + args.lambda_deg * loss_deg
 
         loss_value = loss.item()
 
@@ -124,6 +138,14 @@ def train_one_epoch(model, vae,
 
         metric_logger.update(loss=loss_value)
 
+        metric_logger.update(loss_diff=loss_diff.item())
+        metric_logger.update(loss_mse=loss_mse.item())
+        if args.use_deg_head:
+            loss_deg_value = loss_deg.item()
+            d_mean = d_tok_pred.mean().item()
+            metric_logger.update(loss_deg=loss_deg_value)
+            metric_logger.update(d_tok_mean=d_mean)
+
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
 
@@ -134,8 +156,12 @@ def train_one_epoch(model, vae,
             """
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
+            log_writer.add_scalar('train_loss_diff', misc.all_reduce_mean(loss_diff.item()), epoch_1000x)
+            log_writer.add_scalar('train_loss_mse', misc.all_reduce_mean(loss_mse.item()), epoch_1000x)
             log_writer.add_scalar('lr', lr, epoch_1000x)
-
+            if args.use_deg_head:
+                log_writer.add_scalar('train_loss_deg', misc.all_reduce_mean(loss_deg_value), epoch_1000x)
+                log_writer.add_scalar('train_d_tok_mean', misc.all_reduce_mean(d_mean), epoch_1000x)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -257,14 +283,16 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         with torch.no_grad():
             with torch.amp.autocast('cuda'):
                 # 调用 sample_tokens，传入 x_lr
+                num_iter = args.decode_steps if (args.curriculum_decode and args.decode_steps is not None) else args.num_iter
                 sampled_tokens = model_without_ddp.sample_tokens(
                     bsz=imgs_lr.shape[0], 
-                    num_iter=args.num_iter, 
+                    num_iter=num_iter, 
                     cfg=cfg,
                     cfg_schedule=args.cfg_schedule, 
                     x_lr=x_lr,
                     temperature=args.temperature,
-                    target_seq_len=target_seq_len  
+                    target_seq_len=target_seq_len,
+                    curriculum_decode=args.curriculum_decode,
                 )
             
                 # 解码生成的 Token 变回图片
