@@ -105,10 +105,12 @@ def train_one_epoch(model, vae,
                 posterior_lr = vae.encode(samples_lr)
                 x_lr = posterior_lr.sample().mul_(0.2325)
 
+        gate_multiplier = 1.0
+
         # forward
         with torch.amp.autocast('cuda'):
             # 传入模型
-            model_out = model(x_hr, x_lr)
+            model_out = model(x_hr, x_lr, gate_multiplier=gate_multiplier)
             if args.use_deg_head:
                 loss, loss_diff, loss_mse, d_tok_pred = model_out
             else:
@@ -140,6 +142,11 @@ def train_one_epoch(model, vae,
 
         metric_logger.update(loss_diff=loss_diff.item())
         metric_logger.update(loss_mse=loss_mse.item())
+        if args.use_lr_inject:
+            model_ref = model.module if hasattr(model, "module") else model
+            gate_mean = model_ref.get_lr_inject_gate_mean()
+            metric_logger.update(lr_inject_gate_mean=gate_mean)
+            metric_logger.update(lr_inject_gate_multiplier=gate_multiplier)
         if args.use_deg_head:
             loss_deg_value = loss_deg.item()
             d_mean = d_tok_pred.mean().item()
@@ -159,6 +166,11 @@ def train_one_epoch(model, vae,
             log_writer.add_scalar('train_loss_diff', misc.all_reduce_mean(loss_diff.item()), epoch_1000x)
             log_writer.add_scalar('train_loss_mse', misc.all_reduce_mean(loss_mse.item()), epoch_1000x)
             log_writer.add_scalar('lr', lr, epoch_1000x)
+            if args.use_lr_inject:
+                log_writer.add_scalar('train_lr_inject_gate_mean',
+                                      misc.all_reduce_mean(gate_mean), epoch_1000x)
+                log_writer.add_scalar('train_lr_inject_gate_multiplier',
+                                      misc.all_reduce_mean(gate_multiplier), epoch_1000x)
             if args.use_deg_head:
                 log_writer.add_scalar('train_loss_deg', misc.all_reduce_mean(loss_deg_value), epoch_1000x)
                 log_writer.add_scalar('train_d_tok_mean', misc.all_reduce_mean(d_mean), epoch_1000x)

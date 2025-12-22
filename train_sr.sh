@@ -27,8 +27,9 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --blr 2.0e-2 \
     --hr_data_path /root/autodl-tmp/zanding/data \
     --val_data_path /root/autodl-tmp/zanding/data \
-    --output_dir output_sr_train_10:2:1 \
+    --output_dir output_sr_train_10:2:1_inject \
     --degradation codeformer \
+    --use_lr_inject \
     --use_deg_head \
     --deg_use_sigmoid \
     --eval_freq 4 \
@@ -37,6 +38,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --img_size 512 \
     --multi_scale \
     --lr_schedule cosine \
+    --resume output_sr_train_10:2:1_inject \
     --online_eval
     #--grad_checkpointing \
-    #--resume output_sr_train_diffusionloss_codeformer_RoPE_3 \
+    #--resume output_sr_train_10:2:1_inject \

@@ -10,7 +10,7 @@ from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
 
 from timm.models.vision_transformer import Block, Mlp, DropPath
-
+from typing import List, Optional, Sequence, Tuple
 from models.diffloss import DiffLoss
 
 # =========================================================================
@@ -97,10 +97,53 @@ class RoPEAttention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+class CrossAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def project_kv(self, cond_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        bsz, seq_len, dim = cond_tokens.shape
+        kv = self.kv(cond_tokens).reshape(bsz, seq_len, 2, self.num_heads, dim // self.num_heads)
+        k, v = kv.permute(2, 0, 3, 1, 4)
+        return k, v
+
+    def forward(self, x: torch.Tensor, cond_tokens: Optional[torch.Tensor] = None,
+                cond_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
+        bsz, seq_len, dim = x.shape
+        q = self.q(x).reshape(bsz, seq_len, self.num_heads, dim // self.num_heads).transpose(1, 2)
+
+        if cond_kv is None:
+            if cond_tokens is None:
+                raise ValueError("cond_tokens must be provided when cond_kv is None.")
+            k, v = self.project_kv(cond_tokens)
+        else:
+            k, v = cond_kv
+
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=dropout_p,
+            scale=self.scale
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, dim)
+        attn_out = self.proj(attn_out)
+        attn_out = self.proj_drop(attn_out)
+        return attn_out
 
 class RoPEBlock(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
+                 use_lr_inject=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
         # 使用自定义的 RoPEAttention
@@ -109,11 +152,27 @@ class RoPEBlock(nn.Module):
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-
-    def forward(self, x, freqs_cis=None):
+        self.enable_lr_inject = use_lr_inject
+        if use_lr_inject:
+            self.cross_attn = CrossAttention(
+                dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop
+            )
+            self.norm_cross = norm_layer(dim)
+            self.lr_inject_gate = nn.Parameter(torch.zeros(1))
+        else:
+            self.cross_attn = None
+            self.norm_cross = None
+            self.lr_inject_gate = None
+            
+    def forward(self, x, freqs_cis=None, cond_tokens=None, cond_kv=None, gate_multiplier=1.0):
         # 将 freqs_cis 传入 Attention
         x = x + self.drop_path(self.attn(self.norm1(x), freqs_cis=freqs_cis))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
+        if self.cross_attn is not None and cond_tokens is not None:
+            if not torch.is_tensor(gate_multiplier):
+                gate_multiplier = x.new_tensor(gate_multiplier)
+            cross_out = self.cross_attn(self.norm_cross(x), cond_tokens=cond_tokens, cond_kv=cond_kv)
+            x = x + self.drop_path(cross_out) * gate_multiplier * self.lr_inject_gate
         return x
     
 def precompute_freqs_cis_2d(dim: int, coords_h, coords_w, theta: float = 10000.0):
@@ -234,6 +293,9 @@ class MAR(nn.Module):
                  mse_weight=0.2,
                  use_deg_head=False,
                  deg_use_sigmoid=True,
+                 use_lr_inject=False,
+                 lr_inject_layers="all",
+                 lr_inject_cond_source="encoder",
                  ):
         super().__init__()
 
@@ -251,8 +313,8 @@ class MAR(nn.Module):
         self.mse_weight = mse_weight
         self.use_deg_head = use_deg_head
         self.deg_use_sigmoid = deg_use_sigmoid
-
-
+        self.use_lr_inject = use_lr_inject
+        self.lr_inject_cond_source = lr_inject_cond_source
         # --------------------------------------------------------------------------
         # MAR variant masking ratio, a left-half truncated Gaussian centered at 100% masking ratio with std 0.25
         self.mask_ratio_generator = stats.truncnorm((mask_ratio_min - 1.0) / 0.25, 0, loc=1.0, scale=0.25)
@@ -274,11 +336,16 @@ class MAR(nn.Module):
         # self.encoder_blocks = nn.ModuleList([
         #     Block(encoder_embed_dim, encoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
         #           proj_drop=proj_dropout, attn_drop=attn_dropout) for _ in range(encoder_depth)])
+        encoder_inject_layers = self._resolve_lr_inject_layers(
+            encoder_depth, lr_inject_layers
+        )
         self.encoder_blocks = nn.ModuleList([
-            RoPEBlock(encoder_embed_dim, encoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
-                    drop=proj_dropout, attn_drop=attn_dropout) for _ in range(encoder_depth)])
+            RoPEBlock(
+                encoder_embed_dim, encoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
+                drop=proj_dropout, attn_drop=attn_dropout,
+                use_lr_inject=self.use_lr_inject and i in encoder_inject_layers
+            ) for i in range(encoder_depth)])
         self.encoder_norm = norm_layer(encoder_embed_dim)
-
         # --------------------------------------------------------------------------
         # MAR decoder specifics
 
@@ -293,9 +360,15 @@ class MAR(nn.Module):
         # self.decoder_blocks = nn.ModuleList([
         #     Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
         #           proj_drop=proj_dropout, attn_drop=attn_dropout) for _ in range(decoder_depth)])
+        decoder_inject_layers = self._resolve_lr_inject_layers(
+            decoder_depth, lr_inject_layers
+        )
         self.decoder_blocks = nn.ModuleList([
-            RoPEBlock(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
-                    drop=proj_dropout, attn_drop=attn_dropout) for _ in range(decoder_depth)])
+             RoPEBlock(
+                decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
+                drop=proj_dropout, attn_drop=attn_dropout,
+                use_lr_inject=self.use_lr_inject and i in decoder_inject_layers
+            ) for i in range(decoder_depth)])
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
         # Diffusion 位置编码：这是给 DiffLoss 用的额外位置信息
@@ -320,6 +393,14 @@ class MAR(nn.Module):
                 nn.GELU(),
                 nn.Linear(decoder_embed_dim // 2, 1),
             )
+        if self.use_lr_inject:
+            source_dim = self._infer_lr_inject_source_dim(encoder_embed_dim)
+            self.lr_inject_cond_proj_encoder = self._build_cond_proj(
+                source_dim, encoder_embed_dim
+            )
+            self.lr_inject_cond_proj_decoder = self._build_cond_proj(
+                source_dim, decoder_embed_dim
+            )
 
     def initialize_weights(self):
         # parameters
@@ -332,6 +413,66 @@ class MAR(nn.Module):
             torch.nn.init.constant_(self.final_proj.bias, 0)
 
 
+    def _infer_lr_inject_source_dim(self, encoder_embed_dim):
+        if self.lr_inject_cond_source == "encoder":
+            return encoder_embed_dim
+        if self.lr_inject_cond_source == "patch_embed":
+            return self.token_embed_dim
+        if self.lr_inject_cond_source == "vae_latent":
+            return self.vae_embed_dim
+        raise ValueError(f"Unsupported lr_inject_cond_source: {self.lr_inject_cond_source}")
+
+    @staticmethod
+    def _build_cond_proj(source_dim: int, target_dim: int) -> nn.Module:
+        if source_dim == target_dim:
+            return nn.Identity()
+        return nn.Linear(source_dim, target_dim)
+
+    def _resolve_lr_inject_layers(self, depth: int, mode: str) -> Sequence[int]:
+        if mode == "all":
+            return set(range(depth))
+        if mode == "first_half":
+            return set(range(depth // 2))
+        if mode == "last_half":
+            start = depth - depth // 2
+            return set(range(start, depth))
+        raise ValueError(f"Unsupported lr_inject_layers mode: {mode}")
+
+    def _build_lr_inject_cond_tokens(self, x_lr, lr_tokens=None):
+        if self.lr_inject_cond_source == "vae_latent":
+            cond_tokens = x_lr.permute(0, 2, 3, 1).reshape(x_lr.shape[0], -1, x_lr.shape[1])
+        else:
+            if lr_tokens is None:
+                lr_tokens = self.patchify(x_lr)
+            if self.lr_inject_cond_source == "patch_embed":
+                cond_tokens = lr_tokens
+            elif self.lr_inject_cond_source == "encoder":
+                cond_tokens = self.z_proj_ln(self.z_proj(lr_tokens))
+            else:
+                raise ValueError(f"Unsupported lr_inject_cond_source: {self.lr_inject_cond_source}")
+        return cond_tokens
+
+    @staticmethod
+    def _build_lr_inject_kv_cache(cond_tokens: torch.Tensor, blocks: nn.ModuleList):
+        kv_cache = []
+        for block in blocks:
+            if getattr(block, "cross_attn", None) is not None:
+                kv_cache.append(block.cross_attn.project_kv(cond_tokens))
+            else:
+                kv_cache.append(None)
+        return kv_cache
+
+    def get_lr_inject_gate_mean(self) -> float:
+        if not self.use_lr_inject:
+            return 0.0
+        gates = []
+        for block in list(self.encoder_blocks) + list(self.decoder_blocks):
+            gate = getattr(block, "lr_inject_gate", None)
+            if gate is not None:
+                gates.append(gate.detach().mean())
+        if not gates:
+            return 0.0
+        return torch.stack(gates).mean().item()
 
     def _init_weights(self, m):
         # 初始化全连接层和归一化层的bias和weight
@@ -439,7 +580,8 @@ class MAR(nn.Module):
         # 增加 Batch 维度 [L, D//2]
         return freqs_cis
     
-    def forward_mae_encoder(self, x_hr, mask, x_lr, shape_hr, shape_lr):
+    def forward_mae_encoder(self, x_hr, mask, x_lr, shape_hr, shape_lr,
+                            cond_tokens=None, cond_kv_cache=None, gate_multiplier=1.0):
         # x: [Batch, Seq_Len=256, Dim=16] (VAE 输出的 token)
         # mask: [Batch, Seq_Len=256] (0=可见, 1=遮挡)
         # x_lr: LR tokens（来自VAE编码，维度 16）
@@ -478,17 +620,24 @@ class MAR(nn.Module):
         freqs_cis_kept = freqs_cis_full[keep_indices].reshape(bsz, num_kept, -1)
 
         # Apply Transformer Blocks (传入 freqs_cis)
-        for block in self.encoder_blocks:
+        if cond_tokens is not None:
+            assert cond_tokens.shape[0] == x.shape[0], "cond_tokens batch mismatch with encoder tokens."
+            assert cond_tokens.shape[-1] == embed_dim, "cond_tokens dim mismatch with encoder embed dim."
+        for idx, block in enumerate(self.encoder_blocks):
+            cond_kv = cond_kv_cache[idx] if cond_kv_cache is not None else None
             if self.grad_checkpointing and not torch.jit.is_scripting():         
                 # [修改] 传入 freqs_cis=freqs_cis_kept
-                x = checkpoint(block, x, freqs_cis_kept)
+                gate_multiplier_tensor = x.new_tensor(gate_multiplier)
+                x = checkpoint(block, x, freqs_cis_kept, cond_tokens, cond_kv, gate_multiplier_tensor)
             else:
-                x = block(x, freqs_cis=freqs_cis_kept)
+                x = block(x, freqs_cis=freqs_cis_kept, cond_tokens=cond_tokens,
+                          cond_kv=cond_kv, gate_multiplier=gate_multiplier)
         x = self.encoder_norm(x)
 
         return x
 
-    def forward_mae_decoder(self, x, mask, shape_hr, shape_lr):
+    def forward_mae_decoder(self, x, mask, shape_hr, shape_lr,
+                            cond_tokens=None, cond_kv_cache=None, gate_multiplier=1.0):
         x = self.decoder_embed(x)
         num_lr_tokens = shape_lr[0] * shape_lr[1]
         bsz = x.shape[0]
@@ -513,13 +662,20 @@ class MAR(nn.Module):
         freqs_cis_full = freqs_cis_full.repeat(bsz, 1, 1) # 可选，视显存情况而定
 
         # Apply Transformer Blocks
+        if cond_tokens is not None:
+            assert cond_tokens.shape[0] == x.shape[0], "cond_tokens batch mismatch with decoder tokens."
+            assert cond_tokens.shape[-1] == embed_dim, "cond_tokens dim mismatch with decoder embed dim."
         if self.grad_checkpointing and not torch.jit.is_scripting():
-            for block in self.decoder_blocks:
+            for idx, block in enumerate(self.decoder_blocks):
                 # [修改] 传入 freqs_cis
-                x = checkpoint(block, x, freqs_cis_full)
+                cond_kv = cond_kv_cache[idx] if cond_kv_cache is not None else None
+                gate_multiplier_tensor = x.new_tensor(gate_multiplier)
+                x = checkpoint(block, x, freqs_cis_full, cond_tokens, cond_kv, gate_multiplier_tensor)
         else:
-            for block in self.decoder_blocks:
-                x = block(x, freqs_cis=freqs_cis_full)
+            for idx, block in enumerate(self.decoder_blocks):
+                cond_kv = cond_kv_cache[idx] if cond_kv_cache is not None else None
+                x = block(x, freqs_cis=freqs_cis_full, cond_tokens=cond_tokens,
+                          cond_kv=cond_kv, gate_multiplier=gate_multiplier)
         x = self.decoder_norm(x)
 
         # 移除 Buffer (LR tokens)
@@ -562,7 +718,7 @@ class MAR(nn.Module):
         
         return loss, loss_diff, loss_mse
 
-    def forward(self, x_hr, x_lr):
+    def forward(self, x_hr, x_lr, gate_multiplier=1.0):
         # x_hr: HR Latents [B, 16, 16, 16]
         # x_lr: LR Latents [B, 16, 32, 32]
         # class embed
@@ -586,11 +742,31 @@ class MAR(nn.Module):
         # 生成随机掩码
         orders = self.sample_orders(bsz=hr_tokens.size(0), num_tokens = num_tokens)
         mask = self.random_masking(hr_tokens, orders)
+        cond_tokens_encoder = None
+        cond_tokens_decoder = None
+        cond_kv_cache_encoder = None
+        cond_kv_cache_decoder = None
+        if self.use_lr_inject:
+            cond_tokens_base = self._build_lr_inject_cond_tokens(x_lr, lr_tokens=lr_tokens)
+            cond_tokens_encoder = self.lr_inject_cond_proj_encoder(cond_tokens_base)
+            cond_tokens_decoder = self.lr_inject_cond_proj_decoder(cond_tokens_base)
+            cond_kv_cache_encoder = self._build_lr_inject_kv_cache(cond_tokens_encoder, self.encoder_blocks)
+            cond_kv_cache_decoder = self._build_lr_inject_kv_cache(cond_tokens_decoder, self.decoder_blocks)
 
         # mae encoder
-        x = self.forward_mae_encoder(hr_tokens, mask, lr_tokens, shape_hr, shape_lr)
+        x = self.forward_mae_encoder(
+            hr_tokens, mask, lr_tokens, shape_hr, shape_lr,
+            cond_tokens=cond_tokens_encoder,
+            cond_kv_cache=cond_kv_cache_encoder,
+            gate_multiplier=gate_multiplier
+        )
         # mae decoder
-        z, pos_embed  = self.forward_mae_decoder(x, mask, shape_hr, shape_lr)
+        z, pos_embed  = self.forward_mae_decoder(
+            x, mask, shape_hr, shape_lr,
+            cond_tokens=cond_tokens_decoder,
+            cond_kv_cache=cond_kv_cache_decoder,
+            gate_multiplier=gate_multiplier
+        )
 
         # loss
         loss, loss_diff, loss_mse = self.forward_loss(z=z, pos_embed=pos_embed, target=gt_latents, mask=mask)
@@ -602,8 +778,9 @@ class MAR(nn.Module):
             return loss, loss_diff, loss_mse, d_tok_pred
         
         return loss, loss_diff, loss_mse
-    def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", x_lr=None, temperature=1.0, progress=False, target_seq_len=None, curriculum_decode=False):
-        #num_iter：自回归迭代次数（官方推荐设置256）
+    def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", x_lr=None,
+                      temperature=1.0, progress=False, target_seq_len=None, curriculum_decode=False,
+                      gate_multiplier=1.0):
         # 必须有 LR 输入
         if x_lr is None:
             raise ValueError("Super-Resolution requires LR input!")
@@ -613,6 +790,16 @@ class MAR(nn.Module):
         num_hr_tokens = self.seq_len
         # 先展平 LR tokens
         lr_tokens = self.patchify(x_lr)
+        cond_tokens_encoder = None
+        cond_tokens_decoder = None
+        cond_kv_cache_encoder = None
+        cond_kv_cache_decoder = None
+        if self.use_lr_inject:
+            cond_tokens_base = self._build_lr_inject_cond_tokens(x_lr, lr_tokens=lr_tokens)
+            cond_tokens_encoder = self.lr_inject_cond_proj_encoder(cond_tokens_base)
+            cond_tokens_decoder = self.lr_inject_cond_proj_decoder(cond_tokens_base)
+            cond_kv_cache_encoder = self._build_lr_inject_kv_cache(cond_tokens_encoder, self.encoder_blocks)
+            cond_kv_cache_decoder = self._build_lr_inject_kv_cache(cond_tokens_decoder, self.decoder_blocks)
         # init and sample generation orders
         # 初始化掩码：全为 1 (代表全图被遮挡/未知)
         mask = torch.ones(bsz, num_hr_tokens).cuda()
@@ -624,13 +811,23 @@ class MAR(nn.Module):
             if not self.use_deg_head:
                 raise ValueError("curriculum_decode requires use_deg_head=True.")
             with torch.no_grad():
-                x_full = self.forward_mae_encoder(tokens, mask, lr_tokens, shape_hr, shape_lr)
-                z_full, _ = self.forward_mae_decoder(x_full, mask, shape_hr, shape_lr)
+                x_full = self.forward_mae_encoder(
+                    tokens, mask, lr_tokens, shape_hr, shape_lr,
+                    cond_tokens=cond_tokens_encoder,
+                    cond_kv_cache=cond_kv_cache_encoder,
+                    gate_multiplier=gate_multiplier
+                )
+                z_full, _ = self.forward_mae_decoder(
+                    x_full, mask, shape_hr, shape_lr,
+                    cond_tokens=cond_tokens_decoder,
+                    cond_kv_cache=cond_kv_cache_decoder,
+                    gate_multiplier=gate_multiplier
+                )
             d_tok_pred = self.degradation_head(z_full).squeeze(-1)
             if self.deg_use_sigmoid:
                 d_tok_pred = torch.sigmoid(d_tok_pred)
             assert d_tok_pred.shape[1] == num_hr_tokens, "D_tok_pred shape mismatch with token count."
-            orders = torch.argsort(d_tok_pred, dim=-1)
+            orders = torch.argsort(d_tok_pred, dim=-1, descending=True)
         else:
             orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
 
@@ -642,10 +839,20 @@ class MAR(nn.Module):
         for step in indices:
             cur_tokens = tokens.clone()
             # mae encoder
-            x = self.forward_mae_encoder(tokens, mask, lr_tokens, shape_hr, shape_lr)
+            x = self.forward_mae_encoder(
+                tokens, mask, lr_tokens, shape_hr, shape_lr,
+                cond_tokens=cond_tokens_encoder,
+                cond_kv_cache=cond_kv_cache_encoder,
+                gate_multiplier=gate_multiplier
+            )
             
             # mae decoder
-            z, pos_embed = self.forward_mae_decoder(x, mask, shape_hr, shape_lr)
+            z, pos_embed = self.forward_mae_decoder(
+                x, mask, shape_hr, shape_lr,
+                cond_tokens=cond_tokens_decoder,
+                cond_kv_cache=cond_kv_cache_decoder,
+                gate_multiplier=gate_multiplier
+            )
 
             # mask ratio for the next round, following MaskGIT and MAGE.
             mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)

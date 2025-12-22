@@ -93,7 +93,15 @@ def get_args_parser():
     parser.add_argument('--proj_dropout', type=float, default=0.1,
                         help='projection dropout')
     parser.add_argument('--buffer_size', type=int, default=64)
-
+    
+    parser.add_argument('--use_lr_inject', action='store_true',
+                        help='Enable RestoreVAR-style LR injection')
+    parser.add_argument('--lr_inject_layers', default='all',
+                        choices=['all', 'first_half', 'last_half', 'custom'],
+                        help='LR injection layer selection')
+    parser.add_argument('--lr_inject_cond_source', default='encoder',
+                        choices=['encoder', 'vae_latent', 'patch_embed'],
+                        help='LR condition feature source')
     # Diffusion Loss params
     parser.add_argument('--diffloss_d', type=int, default=12)
     parser.add_argument('--diffloss_w', type=int, default=1536)
@@ -368,6 +376,9 @@ def main(args):
         mse_weight=args.mse_weight,
         use_deg_head=args.use_deg_head,
         deg_use_sigmoid=args.deg_use_sigmoid,
+        use_lr_inject=args.use_lr_inject,
+        lr_inject_layers=args.lr_inject_layers,
+        lr_inject_cond_source=args.lr_inject_cond_source,
     )
 
     print("Model = %s" % str(model))
