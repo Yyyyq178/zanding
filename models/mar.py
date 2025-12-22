@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from timm.models.vision_transformer import Block, Mlp, DropPath
 from typing import List, Optional, Sequence, Tuple
 from models.diffloss import DiffLoss
+from util.misc import is_main_process
 
 # =========================================================================
 # RoPE 核心函数
@@ -117,7 +118,9 @@ class CrossAttention(nn.Module):
         return k, v
 
     def forward(self, x: torch.Tensor, cond_tokens: Optional[torch.Tensor] = None,
-                cond_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
+                cond_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                freqs_cis_q: Optional[torch.Tensor] = None,
+                freqs_cis_k: Optional[torch.Tensor] = None) -> torch.Tensor:
         bsz, seq_len, dim = x.shape
         q = self.q(x).reshape(bsz, seq_len, self.num_heads, dim // self.num_heads).transpose(1, 2)
 
@@ -128,6 +131,14 @@ class CrossAttention(nn.Module):
         else:
             k, v = cond_kv
 
+        if freqs_cis_q is not None:
+            q = q.transpose(1, 2)
+            q, _ = apply_rotary_emb(q, q, freqs_cis_q)
+            q = q.transpose(1, 2)
+        if freqs_cis_k is not None:
+            k = k.transpose(1, 2)
+            k, _ = apply_rotary_emb(k, k, freqs_cis_k)
+            k = k.transpose(1, 2)
         dropout_p = self.attn_drop.p if self.training else 0.0
         attn_out = F.scaled_dot_product_attention(
             q, k, v,
@@ -149,6 +160,7 @@ class RoPEBlock(nn.Module):
         # 使用自定义的 RoPEAttention
         self.attn = RoPEAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        # 2. MLP (Feed-Forward)
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
@@ -164,14 +176,21 @@ class RoPEBlock(nn.Module):
             self.norm_cross = None
             self.lr_inject_gate = None
             
-    def forward(self, x, freqs_cis=None, cond_tokens=None, cond_kv=None, gate_multiplier=1.0):
+    def forward(self, x, freqs_cis=None, cond_tokens=None, cond_kv=None, gate_multiplier=1.0,
+                cross_attn_freqs_q=None, cross_attn_freqs_k=None):
         # 将 freqs_cis 传入 Attention
         x = x + self.drop_path(self.attn(self.norm1(x), freqs_cis=freqs_cis))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         if self.cross_attn is not None and cond_tokens is not None:
             if not torch.is_tensor(gate_multiplier):
                 gate_multiplier = x.new_tensor(gate_multiplier)
-            cross_out = self.cross_attn(self.norm_cross(x), cond_tokens=cond_tokens, cond_kv=cond_kv)
+            cross_out = self.cross_attn(
+                self.norm_cross(x),
+                cond_tokens=cond_tokens,
+                cond_kv=cond_kv,
+                freqs_cis_q=cross_attn_freqs_q,
+                freqs_cis_k=cross_attn_freqs_k
+            )
             x = x + self.drop_path(cross_out) * gate_multiplier * self.lr_inject_gate
         return x
     
@@ -401,7 +420,20 @@ class MAR(nn.Module):
             self.lr_inject_cond_proj_decoder = self._build_cond_proj(
                 source_dim, decoder_embed_dim
             )
+        self._lr_inject_rope_logged = False
 
+    def _maybe_log_lr_inject_rope(self, num_img_tokens: int, shape_hr: Tuple[int, int]) -> None:
+        if not self.use_lr_inject or self._lr_inject_rope_logged:
+            return
+        if not is_main_process():
+            return
+        h_tokens, w_tokens = shape_hr
+        skip_special_tokens = False
+        print(
+            f"[LR Inject RoPE] N_img={num_img_tokens} Ht={h_tokens} Wt={w_tokens} "
+            f"skip_special_tokens={skip_special_tokens}"
+        )
+        self._lr_inject_rope_logged = True
     def initialize_weights(self):
         # parameters
         torch.nn.init.normal_(self.mask_token, std=.02)
@@ -598,11 +630,13 @@ class MAR(nn.Module):
         x = torch.cat([lr_embedding, hr_embedding], dim=1)
 
         # 计算完整的 RoPE 频率
+        num_lr_tokens = shape_lr[0] * shape_lr[1]
         freqs_cis_full = self.get_rope_freqs(shape_hr, shape_lr, x.device, head_dim)
         freqs_cis_full = freqs_cis_full.unsqueeze(0).repeat(bsz, 1, 1) # 扩展到 Batch
+        freqs_cis_lr = freqs_cis_full[:, :num_lr_tokens]
 
         # 构造 Mask (LR 永远可见)
-        num_lr_tokens = shape_lr[0] * shape_lr[1]
+        #num_lr_tokens = shape_lr[0] * shape_lr[1]
         mask_with_buffer = torch.cat([torch.zeros(bsz, num_lr_tokens, device=x.device), mask], dim=1)
 
         x = self.z_proj_ln(x)
@@ -628,10 +662,14 @@ class MAR(nn.Module):
             if self.grad_checkpointing and not torch.jit.is_scripting():         
                 # [修改] 传入 freqs_cis=freqs_cis_kept
                 gate_multiplier_tensor = x.new_tensor(gate_multiplier)
-                x = checkpoint(block, x, freqs_cis_kept, cond_tokens, cond_kv, gate_multiplier_tensor)
+                x = checkpoint(
+                    block, x, freqs_cis_kept, cond_tokens, cond_kv, gate_multiplier_tensor,
+                    freqs_cis_kept, freqs_cis_lr
+                )
             else:
                 x = block(x, freqs_cis=freqs_cis_kept, cond_tokens=cond_tokens,
-                          cond_kv=cond_kv, gate_multiplier=gate_multiplier)
+                          cond_kv=cond_kv, gate_multiplier=gate_multiplier,
+                          cross_attn_freqs_q=freqs_cis_kept, cross_attn_freqs_k=freqs_cis_lr)
         x = self.encoder_norm(x)
 
         return x
@@ -670,12 +708,17 @@ class MAR(nn.Module):
                 # [修改] 传入 freqs_cis
                 cond_kv = cond_kv_cache[idx] if cond_kv_cache is not None else None
                 gate_multiplier_tensor = x.new_tensor(gate_multiplier)
-                x = checkpoint(block, x, freqs_cis_full, cond_tokens, cond_kv, gate_multiplier_tensor)
+                x = checkpoint(
+                    block, x, freqs_cis_full, cond_tokens, cond_kv, gate_multiplier_tensor,
+                    freqs_cis_full, freqs_cis_full[:, :num_lr_tokens]
+                )
         else:
             for idx, block in enumerate(self.decoder_blocks):
                 cond_kv = cond_kv_cache[idx] if cond_kv_cache is not None else None
                 x = block(x, freqs_cis=freqs_cis_full, cond_tokens=cond_tokens,
-                          cond_kv=cond_kv, gate_multiplier=gate_multiplier)
+                          cond_kv=cond_kv, gate_multiplier=gate_multiplier,
+                          cross_attn_freqs_q=freqs_cis_full,
+                          cross_attn_freqs_k=freqs_cis_full[:, :num_lr_tokens])
         x = self.decoder_norm(x)
 
         # 移除 Buffer (LR tokens)
@@ -737,6 +780,7 @@ class MAR(nn.Module):
         hr_tokens = self.patchify(x_hr)
         # 获取当前 batch 的真实 token 数量
         num_tokens = hr_tokens.shape[1]
+        self._maybe_log_lr_inject_rope(num_tokens, shape_hr)
         # 备份groundtruth（gt_latents）
         gt_latents = hr_tokens.clone().detach()
         # 生成随机掩码
@@ -788,6 +832,7 @@ class MAR(nn.Module):
         shape_lr = (self.seq_h, self.seq_w)
         shape_hr = (self.seq_h, self.seq_w)
         num_hr_tokens = self.seq_len
+        self._maybe_log_lr_inject_rope(num_hr_tokens, shape_hr)
         # 先展平 LR tokens
         lr_tokens = self.patchify(x_lr)
         cond_tokens_encoder = None
