@@ -19,10 +19,13 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --batch_size 1 \
     --eval_bsz 8 \
     --img_size 512 \
-    --resume output_sr_train_diffusionloss_codeformer_RoPE_3_1:5_swinir_kl-f16 \
+    --resume output_sr_train_10:2:1_inject \
     --evaluate \
     --hr_data_path /root/autodl-tmp/zanding/CelebA-Test-3000/HQ \
-    --use_swinir \
-    --swinir_ckpt pretrained_models/swinir/face_swinir_v1.ckpt \
-    --swinir_batch 4 \
+    --use_lr_inject \
+    --use_deg_head \
+    --deg_use_sigmoid \
     --output_dir output_test_hr_only
+    #--use_swinir \
+    #--swinir_batch 4 \
+    #--swinir_ckpt pretrained_models/swinir/face_swinir_v1.ckpt \

@@ -21,14 +21,11 @@ images_codeformer_swinir/
 *.zip
 *.tar.gz
 
-#测试文件
-test_continuous_demo.py
-test_multiscale.py
-prepare_data.py
-ttt/
-results_continuous/
-test_lr_images/
-results_continuous_1/
-preprocess_swinir.py
-dataset_paired.py
+#数据集
 CelebA-Test-3000/
+
+#其他
+logs
+*.json
+dataset_paired.py
+prepare_codeformer_dataset.py

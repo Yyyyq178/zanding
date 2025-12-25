@@ -265,9 +265,9 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         imgs_lr = imgs_lr.cuda(args.device, non_blocking=True)
 
         # 为了节省时间，只跑前 5 个 batch 看效果
-        if i >= 5: 
-            print("Finished 5 batches preview, stopping evaluation.")
-            break 
+        # if i >= 5: 
+        #     print("Finished 5 batches preview, stopping evaluation.")
+        #     break 
         if not paired_mode:
             # 如果是单独运行测试脚本 (args.evaluate=True)，且不是在线验证 (args.online_eval=False)
             # 或者你可以直接简单粗暴地判断：如果是测试模式，就用随机
