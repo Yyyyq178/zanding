@@ -27,5 +27,4 @@ CelebA-Test-3000/
 #其他
 logs
 *.json
-dataset_paired.py
 prepare_codeformer_dataset.py
