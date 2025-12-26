@@ -20,8 +20,8 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --use_lr_inject \
     --use_deg_head \
     --deg_use_sigmoid \
+    --use_rope \
+    --use_mse_loss \
+    --curriculum_decode \
     --output_dir output_zanding
-    #--no-use_rope --no-use_mse_loss
-    #--use_swinir \
-    #--swinir_batch 4 \
-    #--swinir_ckpt pretrained_models/swinir/face_swinir_v1.ckpt \
+

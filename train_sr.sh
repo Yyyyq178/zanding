@@ -19,7 +19,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --vae_stride 16 \
     --patch_size 1 \
     --cfg 1.0 \
-    --epochs 800 \
+    --epochs 400 \
     --warmup_epochs 10 \
     --batch_size 8 \
     --grad_clip 1.0 \
@@ -27,19 +27,19 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --blr 2.0e-2 \
     --hr_data_path /root/autodl-tmp/zanding/data \
     --val_data_path /root/autodl-tmp/zanding/data \
-    --output_dir output_sr_train_10:2:1_inject \
+    --output_dir output_All \
     --degradation codeformer \
+    --eval_freq 4 \
+    --save_last_freq 2 \
+    --curriculum_decode \
+    --eval_bsz 8 \
+    --img_size 512 \
+    --lr_schedule cosine \
+    --multi_scale \
     --use_lr_inject \
     --use_deg_head \
     --deg_use_sigmoid \
-    --eval_freq 4 \
-    --save_last_freq 2 \
-    --eval_bsz 8 \
-    --img_size 512 \
-    --multi_scale \
-    --lr_schedule cosine \
-    --resume output_sr_train_10:2:1_inject \
+    --use_rope \
+    --use_mse_loss \
     --online_eval
-    #--no-use_rope --no-use_mse_loss
-    #--grad_checkpointing \
-    #--resume output_sr_train_10:2:1_inject \
+#   --resume output_sr_train_10:2:1_inject \

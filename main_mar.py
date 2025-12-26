@@ -108,8 +108,7 @@ def get_args_parser():
     parser.add_argument('--num_sampling_steps', type=str, default="ddim100")
     parser.add_argument('--diffusion_batch_mul', type=int, default=1)
     parser.add_argument('--temperature', default=1.0, type=float, help='diffusion loss sampling temperature')
-    # MSE 损失权重，默认为 0.2
-    parser.add_argument('--mse_weight', default=0.2, type=float, help='Weight for MSE loss')
+    
     # Degradation head params
     parser.add_argument('--use_deg_head', action='store_true', help='Enable degradation prediction head')
     parser.add_argument('--lambda_deg', default=0.8, type=float, help='Weight for degradation loss')
@@ -118,10 +117,11 @@ def get_args_parser():
     parser.add_argument('--deg_use_sigmoid', action='store_true', help='Apply sigmoid to degradation head output')
     parser.add_argument('--curriculum_decode', action='store_true', help='Enable hard-order curriculum decoding')
     parser.add_argument('--decode_steps', default=None, type=int, help='Override decoding steps for curriculum')
-    parser.add_argument('--use_rope', action=argparse.BooleanOptionalAction, default=True,
-                        help='Use 2D RoPE; disable to use absolute positional embeddings')
-    parser.add_argument('--use_mse_loss', action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument('--use_rope', action='store_true',
+                        help='Use 2D RoPE; default is absolute positional embeddings')
+    parser.add_argument('--use_mse_loss', action='store_true',
                         help='Enable MSE loss component')
+    parser.add_argument('--mse_weight', default=0.2, type=float, help='Weight for MSE loss')
     # Dataset parameters
     parser.add_argument('--hr_data_path', default=None, type=str,
                         help='dataset path for High Resolution images')
@@ -367,8 +367,6 @@ def main(args):
         patch_size=args.patch_size,
         vae_embed_dim=args.vae_embed_dim,
         mask_ratio_min=args.mask_ratio_min,
-        #label_drop_prob=args.label_drop_prob,
-        #class_num=args.class_num,
         attn_dropout=args.attn_dropout,
         proj_dropout=args.proj_dropout,
         buffer_size=args.buffer_size,

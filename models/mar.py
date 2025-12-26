@@ -315,8 +315,8 @@ class MAR(nn.Module):
                  use_lr_inject=False,
                  lr_inject_layers="all",
                  lr_inject_cond_source="encoder",
-                 use_rope=True,
-                 use_mse_loss=True,
+                 use_rope=False,
+                 use_mse_loss=False,
                  ):
         super().__init__()
 
@@ -997,8 +997,8 @@ class MAR(nn.Module):
 
 def mar_base(**kwargs):
     model = MAR(
-        encoder_embed_dim=768, encoder_depth=12, encoder_num_heads=12,
-        decoder_embed_dim=768, decoder_depth=12, decoder_num_heads=12,
+        encoder_embed_dim=768, encoder_depth=8, encoder_num_heads=8,
+        decoder_embed_dim=768, decoder_depth=8, decoder_num_heads=8,
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
