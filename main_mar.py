@@ -118,6 +118,10 @@ def get_args_parser():
     parser.add_argument('--deg_use_sigmoid', action='store_true', help='Apply sigmoid to degradation head output')
     parser.add_argument('--curriculum_decode', action='store_true', help='Enable hard-order curriculum decoding')
     parser.add_argument('--decode_steps', default=None, type=int, help='Override decoding steps for curriculum')
+    parser.add_argument('--use_rope', action=argparse.BooleanOptionalAction, default=True,
+                        help='Use 2D RoPE; disable to use absolute positional embeddings')
+    parser.add_argument('--use_mse_loss', action=argparse.BooleanOptionalAction, default=True,
+                        help='Enable MSE loss component')
     # Dataset parameters
     parser.add_argument('--hr_data_path', default=None, type=str,
                         help='dataset path for High Resolution images')
@@ -379,6 +383,8 @@ def main(args):
         use_lr_inject=args.use_lr_inject,
         lr_inject_layers=args.lr_inject_layers,
         lr_inject_cond_source=args.lr_inject_cond_source,
+        use_rope=args.use_rope,
+        use_mse_loss=args.use_mse_loss,
     )
 
     print("Model = %s" % str(model))

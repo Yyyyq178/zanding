@@ -3,9 +3,13 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
 
 class PairedSRDataset(Dataset):
-    """同时读取 HR 和 LR 文件夹 (用于 paired_test)"""
+    """
+    用于 Paired Test (HR + LR 文件夹)。
+    逻辑：测试阶段 -> 随机裁剪 (HR 和 LR 保持同步裁剪)
+    """
     def __init__(self, root_hr, root_lr, img_size=512):
         super().__init__()
         self.root_hr = root_hr
@@ -31,8 +35,22 @@ class PairedSRDataset(Dataset):
         img_hr = Image.open(hr_path).convert('RGB')
         img_lr = Image.open(lr_path).convert('RGB')
 
-        img_hr = img_hr.resize((self.img_size, self.img_size), Image.BICUBIC)
-        img_lr = img_lr.resize((self.img_size, self.img_size), Image.BICUBIC)
+        # --- 这里的逻辑修改为：如果大于 img_size，则随机裁剪 (HR/LR 同步) ---
+        W, H = img_hr.size
+        # 假设 LR 和 HR 尺寸在物理上是对应的（如果是 Paired 数据集通常是匹配的，或者 LR 也是大图）
+        # 如果你的 Paired 数据集里 LR 本来就是小图 (e.g. 128x128)，这里的裁剪逻辑需要根据倍率调整。
+        # 但根据你之前的代码 img_lr.resize((512,512))，看起来输入模型前 LR 和 HR 是同尺寸的。
+        
+        if W > self.img_size and H > self.img_size:
+            # 获取随机裁剪参数
+            i, j, h, w = transforms.RandomCrop.get_params(img_hr, output_size=(self.img_size, self.img_size))
+            # 对 HR 和 LR 应用完全相同的裁剪，保证对齐
+            img_hr = TF.crop(img_hr, i, j, h, w)
+            img_lr = TF.crop(img_lr, i, j, h, w)
+        else:
+            # 尺寸不够，回退到缩放
+            img_hr = TF.resize(img_hr, (self.img_size, self.img_size))
+            img_lr = TF.resize(img_lr, (self.img_size, self.img_size))
 
         return self.normalize(img_hr), self.normalize(img_lr), self.hr_files[index]
 
@@ -41,13 +59,15 @@ class PairedSRDataset(Dataset):
 
 
 class HROnlyDataset(Dataset):
-    """[新增] 只读取 HR 文件夹 (用于自动退化测试)，支持扁平目录结构"""
+    """
+    用于 HR Only Test (自动退化)。
+    逻辑：测试阶段 -> 随机裁剪 HR
+    """
     def __init__(self, root_hr, img_size=512):
         super().__init__()
         self.root_hr = root_hr
         self.img_size = img_size
         
-        # 读取所有支持的图片格式
         self.hr_files = sorted([
             f for f in os.listdir(root_hr) 
             if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp'))
@@ -65,14 +85,19 @@ class HROnlyDataset(Dataset):
         hr_path = os.path.join(self.root_hr, self.hr_files[index])
         img_hr = Image.open(hr_path).convert('RGB')
         
-        # 强制 Resize 到 512，保证 VAE 不会因为尺寸不对而报错
-        if img_hr.size != (self.img_size, self.img_size):
-            img_hr = img_hr.resize((self.img_size, self.img_size), Image.BICUBIC)
+        # --- 修改为随机裁剪 ---
+        W, H = img_hr.size
+        
+        if W > self.img_size and H > self.img_size:
+            # 随机裁剪
+            i, j, h, w = transforms.RandomCrop.get_params(img_hr, output_size=(self.img_size, self.img_size))
+            img_hr = TF.crop(img_hr, i, j, h, w)
+        else:
+            # 缩放
+            img_hr = TF.resize(img_hr, (self.img_size, self.img_size))
         
         hr_tensor = self.normalize(img_hr)
         
-        # 返回：HR, Dummy_LR (用HR占位), Filename
-        # 真正的 LR 会在 engine_mar.py 中通过 degradation_model 在线生成
         return hr_tensor, hr_tensor, self.hr_files[index]
 
     def __len__(self):

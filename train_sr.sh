@@ -40,5 +40,6 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --lr_schedule cosine \
     --resume output_sr_train_10:2:1_inject \
     --online_eval
+    #--no-use_rope --no-use_mse_loss
     #--grad_checkpointing \
     #--resume output_sr_train_10:2:1_inject \

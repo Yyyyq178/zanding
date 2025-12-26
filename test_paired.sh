@@ -21,6 +21,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --use_deg_head \
     --deg_use_sigmoid \
     --output_dir output_zanding
+    #--no-use_rope --no-use_mse_loss
     #--use_swinir \
     #--swinir_batch 4 \
     #--swinir_ckpt pretrained_models/swinir/face_swinir_v1.ckpt \

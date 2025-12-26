@@ -315,6 +315,8 @@ class MAR(nn.Module):
                  use_lr_inject=False,
                  lr_inject_layers="all",
                  lr_inject_cond_source="encoder",
+                 use_rope=True,
+                 use_mse_loss=True,
                  ):
         super().__init__()
 
@@ -334,6 +336,8 @@ class MAR(nn.Module):
         self.deg_use_sigmoid = deg_use_sigmoid
         self.use_lr_inject = use_lr_inject
         self.lr_inject_cond_source = lr_inject_cond_source
+        self.use_rope = use_rope
+        self.use_mse_loss = use_mse_loss
         # --------------------------------------------------------------------------
         # MAR variant masking ratio, a left-half truncated Gaussian centered at 100% masking ratio with std 0.25
         self.mask_ratio_generator = stats.truncnorm((mask_ratio_min - 1.0) / 0.25, 0, loc=1.0, scale=0.25)
@@ -349,8 +353,12 @@ class MAR(nn.Module):
         # 缓冲区大小：定义前缀长度 (64)
         self.buffer_size = buffer_size
         # 位置编码：这是一个可学习的参数表，长度 = 序列长度(256) + 缓冲区长度(64) = 320，维度 = 1024
-        #self.encoder_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, encoder_embed_dim))
-
+        if not self.use_rope:
+            lr_token_len = self.seq_h * self.seq_w
+            total_tokens = lr_token_len + self.seq_len
+            self.encoder_pos_embed_learned = nn.Parameter(
+                torch.zeros(1, total_tokens, encoder_embed_dim)
+            )
         # Transformer Blocks：堆叠 16 层
         # self.encoder_blocks = nn.ModuleList([
         #     Block(encoder_embed_dim, encoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
@@ -373,7 +381,12 @@ class MAR(nn.Module):
         # mask_token：这是一个特殊的向量，代表“未知”，所有被遮住的位置，都会填入这个向量
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
         # Decoder 位置编码
-        #self.decoder_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, decoder_embed_dim))
+        if not self.use_rope:
+            lr_token_len = self.seq_h * self.seq_w
+            total_tokens = lr_token_len + self.seq_len
+            self.decoder_pos_embed_learned = nn.Parameter(
+                torch.zeros(1, total_tokens, decoder_embed_dim)
+            )
 
         # Transformer Blocks：堆叠 16 层
         # self.decoder_blocks = nn.ModuleList([
@@ -420,6 +433,14 @@ class MAR(nn.Module):
             self.lr_inject_cond_proj_decoder = self._build_cond_proj(
                 source_dim, decoder_embed_dim
             )
+            if not self.use_rope:
+                lr_seq_len = self.seq_h * self.seq_w
+                self.lr_pos_embed_encoder = nn.Parameter(
+                    torch.zeros(1, lr_seq_len, encoder_embed_dim)
+                )
+                self.lr_pos_embed_decoder = nn.Parameter(
+                    torch.zeros(1, lr_seq_len, decoder_embed_dim)
+                )
         self._lr_inject_rope_logged = False
 
     def _maybe_log_lr_inject_rope(self, num_img_tokens: int, shape_hr: Tuple[int, int]) -> None:
@@ -629,18 +650,23 @@ class MAR(nn.Module):
         # [修改] 移除中间定义的 pos_embed 变量和加法
         x = torch.cat([lr_embedding, hr_embedding], dim=1)
 
-        # 计算完整的 RoPE 频率
         num_lr_tokens = shape_lr[0] * shape_lr[1]
-        freqs_cis_full = self.get_rope_freqs(shape_hr, shape_lr, x.device, head_dim)
-        freqs_cis_full = freqs_cis_full.unsqueeze(0).repeat(bsz, 1, 1) # 扩展到 Batch
-        freqs_cis_lr = freqs_cis_full[:, :num_lr_tokens]
+        if self.use_rope:
+            freqs_cis_full = self.get_rope_freqs(shape_hr, shape_lr, x.device, head_dim)
+            freqs_cis_full = freqs_cis_full.unsqueeze(0).repeat(bsz, 1, 1) # 扩展到 Batch
+            freqs_cis_lr = freqs_cis_full[:, :num_lr_tokens]
+        else:
+            freqs_cis_full = None
+            freqs_cis_lr = None
 
         # 构造 Mask (LR 永远可见)
         #num_lr_tokens = shape_lr[0] * shape_lr[1]
         mask_with_buffer = torch.cat([torch.zeros(bsz, num_lr_tokens, device=x.device), mask], dim=1)
 
         x = self.z_proj_ln(x)
-
+        if not self.use_rope:
+            pos_embed = self.encoder_pos_embed_learned[:, : x.shape[1], :]
+            x = x + pos_embed
         # Dropping (同时筛选 Feature 和 频率)
         keep_indices = (1 - mask_with_buffer).nonzero(as_tuple=True)
         
@@ -651,7 +677,7 @@ class MAR(nn.Module):
         x = x[keep_indices].reshape(bsz, num_kept, embed_dim)
         
         # [新增] 筛选 Frequencies
-        freqs_cis_kept = freqs_cis_full[keep_indices].reshape(bsz, num_kept, -1)
+        freqs_cis_kept = None if freqs_cis_full is None else freqs_cis_full[keep_indices].reshape(bsz, num_kept, -1)
 
         # Apply Transformer Blocks (传入 freqs_cis)
         if cond_tokens is not None:
@@ -693,11 +719,17 @@ class MAR(nn.Module):
         x_after_pad[keep_indices] = x.reshape(-1, embed_dim)
         x = x_after_pad
 
-        # 计算完整 RoPE 频率
-        freqs_cis_full = self.get_rope_freqs(shape_hr, shape_lr, x.device, head_dim)
-        # 注意：这里不需要 repeat 到 batch 维度，apply_rotary_emb 会处理广播，
-        # 或者为了保险起见，跟 Encoder 保持一致：
-        freqs_cis_full = freqs_cis_full.repeat(bsz, 1, 1) # 可选，视显存情况而定
+        if self.use_rope:
+            freqs_cis_full = self.get_rope_freqs(shape_hr, shape_lr, x.device, head_dim)
+            # 注意：这里不需要 repeat 到 batch 维度，apply_rotary_emb 会处理广播，
+            # 或者为了保险起见，跟 Encoder 保持一致：
+            freqs_cis_full = freqs_cis_full.repeat(bsz, 1, 1) # 可选，视显存情况而定
+        else:
+            freqs_cis_full = None
+            if not hasattr(self, "decoder_pos_embed_learned"):
+                raise RuntimeError("decoder_pos_embed_learned is not initialized when use_rope=False")
+            pos_embed = self.decoder_pos_embed_learned[:, : x.shape[1], :]
+            x = x + pos_embed
 
         # Apply Transformer Blocks
         if cond_tokens is not None:
@@ -710,7 +742,7 @@ class MAR(nn.Module):
                 gate_multiplier_tensor = x.new_tensor(gate_multiplier)
                 x = checkpoint(
                     block, x, freqs_cis_full, cond_tokens, cond_kv, gate_multiplier_tensor,
-                    freqs_cis_full, freqs_cis_full[:, :num_lr_tokens]
+                    freqs_cis_full, freqs_cis_full[:, :num_lr_tokens] if freqs_cis_full is not None else None
                 )
         else:
             for idx, block in enumerate(self.decoder_blocks):
@@ -718,7 +750,7 @@ class MAR(nn.Module):
                 x = block(x, freqs_cis=freqs_cis_full, cond_tokens=cond_tokens,
                           cond_kv=cond_kv, gate_multiplier=gate_multiplier,
                           cross_attn_freqs_q=freqs_cis_full,
-                          cross_attn_freqs_k=freqs_cis_full[:, :num_lr_tokens])
+                          cross_attn_freqs_k=freqs_cis_full[:, :num_lr_tokens] if freqs_cis_full is not None else None)
         x = self.decoder_norm(x)
 
         # 移除 Buffer (LR tokens)
@@ -740,12 +772,13 @@ class MAR(nn.Module):
         # z: Decoder 预测出的 Latent 特征 [Batch, Seq_Len, Dim]
         # target: 真实的 Latent 特征 (Ground Truth) [Batch, Seq_Len, Dim]
         # mask: 当前的遮挡掩码 [Batch, Seq_Len]  
-        z_projected = self.final_proj(z)
-        loss_mse_element = (z_projected - target) ** 2
-
-        loss_mse_token = loss_mse_element.mean(dim=-1)
-
-        loss_mse = (loss_mse_token * mask).sum() / (mask.sum() + 1e-6)
+        if self.use_mse_loss:
+            z_projected = self.final_proj(z)
+            loss_mse_element = (z_projected - target) ** 2
+            loss_mse_token = loss_mse_element.mean(dim=-1)
+            loss_mse = (loss_mse_token * mask).sum() / (mask.sum() + 1e-6)
+        else:
+            loss_mse = torch.zeros(1, device=z.device, dtype=z.dtype)
         z_for_diff = z + pos_embed
         bsz, seq_len, _ = target.shape
 
@@ -757,7 +790,7 @@ class MAR(nn.Module):
         mask_diff = mask.reshape(bsz*seq_len).repeat(self.diffusion_batch_mul)
 
         loss_diff = self.diffloss(z=z_diff, target=target_diff, mask=mask_diff)
-        loss = loss_diff + self.mse_weight * loss_mse
+        loss = loss_diff + (self.mse_weight * loss_mse if self.use_mse_loss else loss_mse)
         
         return loss, loss_diff, loss_mse
 
@@ -794,6 +827,11 @@ class MAR(nn.Module):
             cond_tokens_base = self._build_lr_inject_cond_tokens(x_lr, lr_tokens=lr_tokens)
             cond_tokens_encoder = self.lr_inject_cond_proj_encoder(cond_tokens_base)
             cond_tokens_decoder = self.lr_inject_cond_proj_decoder(cond_tokens_base)
+            if not self.use_rope:
+                lr_pos_enc = self.lr_pos_embed_encoder[:, : cond_tokens_encoder.shape[1], :]
+                lr_pos_dec = self.lr_pos_embed_decoder[:, : cond_tokens_decoder.shape[1], :]
+                cond_tokens_encoder = cond_tokens_encoder + lr_pos_enc
+                cond_tokens_decoder = cond_tokens_decoder + lr_pos_dec
             cond_kv_cache_encoder = self._build_lr_inject_kv_cache(cond_tokens_encoder, self.encoder_blocks)
             cond_kv_cache_decoder = self._build_lr_inject_kv_cache(cond_tokens_decoder, self.decoder_blocks)
 
@@ -843,6 +881,11 @@ class MAR(nn.Module):
             cond_tokens_base = self._build_lr_inject_cond_tokens(x_lr, lr_tokens=lr_tokens)
             cond_tokens_encoder = self.lr_inject_cond_proj_encoder(cond_tokens_base)
             cond_tokens_decoder = self.lr_inject_cond_proj_decoder(cond_tokens_base)
+            if not self.use_rope:
+                lr_pos_enc = self.lr_pos_embed_encoder[:, : cond_tokens_encoder.shape[1], :]
+                lr_pos_dec = self.lr_pos_embed_decoder[:, : cond_tokens_decoder.shape[1], :]
+                cond_tokens_encoder = cond_tokens_encoder + lr_pos_enc
+                cond_tokens_decoder = cond_tokens_decoder + lr_pos_dec
             cond_kv_cache_encoder = self._build_lr_inject_kv_cache(cond_tokens_encoder, self.encoder_blocks)
             cond_kv_cache_decoder = self._build_lr_inject_kv_cache(cond_tokens_decoder, self.decoder_blocks)
         # init and sample generation orders
