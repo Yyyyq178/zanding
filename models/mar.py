@@ -768,15 +768,17 @@ class MAR(nn.Module):
         pos_embed_hr_only = pos_embed_hr_only.expand(bsz, -1, -1)
         return x, pos_embed_hr_only
 
-    def forward_loss(self, z, pos_embed, target, mask):
+    def forward_loss(self, z, pos_embed, target, mask, loss_mask=None):
         # z: Decoder 预测出的 Latent 特征 [Batch, Seq_Len, Dim]
         # target: 真实的 Latent 特征 (Ground Truth) [Batch, Seq_Len, Dim]
         # mask: 当前的遮挡掩码 [Batch, Seq_Len]  
+        if loss_mask is None:
+            loss_mask = mask
         if self.use_mse_loss:
             z_projected = self.final_proj(z)
             loss_mse_element = (z_projected - target) ** 2
             loss_mse_token = loss_mse_element.mean(dim=-1)
-            loss_mse = (loss_mse_token * mask).sum() / (mask.sum() + 1e-6)
+            loss_mse = (loss_mse_token * loss_mask).sum() / (loss_mask.sum() + 1e-6)
         else:
             loss_mse = torch.zeros(1, device=z.device, dtype=z.dtype)
         z_for_diff = z + pos_embed
@@ -787,14 +789,30 @@ class MAR(nn.Module):
         
         # 使用加了位置编码的 z_for_diff
         z_diff = z_for_diff.reshape(bsz*seq_len, -1).repeat(self.diffusion_batch_mul, 1)
-        mask_diff = mask.reshape(bsz*seq_len).repeat(self.diffusion_batch_mul)
+        mask_diff = loss_mask.reshape(bsz*seq_len).repeat(self.diffusion_batch_mul)
 
         loss_diff = self.diffloss(z=z_diff, target=target_diff, mask=mask_diff)
         loss = loss_diff + (self.mse_weight * loss_mse if self.use_mse_loss else loss_mse)
         
         return loss, loss_diff, loss_mse
 
-    def forward(self, x_hr, x_lr, gate_multiplier=1.0):
+    def _build_curriculum_mask_lens(self, num_iter: int, num_tokens: int, device: torch.device) -> torch.Tensor:
+        mask_lens = []
+        prev_len = torch.tensor(float(num_tokens), device=device)
+        for step in range(num_iter):
+            mask_ratio = math.cos(math.pi / 2. * (step + 1) / num_iter)
+            proposed = math.floor(num_tokens * mask_ratio)
+            mask_len = torch.tensor(proposed, device=device, dtype=torch.float)
+            mask_len = torch.maximum(torch.tensor(1.0, device=device), torch.minimum(prev_len - 1, mask_len))
+            if step >= num_iter - 1:
+                mask_len = torch.tensor(0.0, device=device)
+            mask_lens.append(mask_len.long())
+            prev_len = mask_len
+        return torch.stack(mask_lens, dim=0)
+
+    def forward(self, x_hr, x_lr, gate_multiplier=1.0, curriculum_decode: bool = False, num_iter: int = None,
+                d_tok_gt: torch.Tensor = None, global_step: int = 0,
+                curriculum_pred_order_warmup_steps: int = 2000, curriculum_pred_order_prob_max: float = 1.0):
         # x_hr: HR Latents [B, 16, 16, 16]
         # x_lr: LR Latents [B, 16, 32, 32]
         # class embed
@@ -816,9 +834,43 @@ class MAR(nn.Module):
         self._maybe_log_lr_inject_rope(num_tokens, shape_hr)
         # 备份groundtruth（gt_latents）
         gt_latents = hr_tokens.clone().detach()
-        # 生成随机掩码
-        orders = self.sample_orders(bsz=hr_tokens.size(0), num_tokens = num_tokens)
-        mask = self.random_masking(hr_tokens, orders)
+        if self.training and curriculum_decode:
+            if not self.use_deg_head:
+                raise ValueError("curriculum_decode requires use_deg_head=True.")
+            if num_iter is None:
+                raise ValueError("num_iter must be provided when curriculum_decode is enabled during training.")
+            deg_features = self.decoder_embed(self.z_proj_ln(self.z_proj(hr_tokens)))
+            d_tok_pred = self.degradation_head(deg_features).squeeze(-1)
+            if self.deg_use_sigmoid:
+                d_tok_pred = torch.sigmoid(d_tok_pred)
+            if d_tok_gt is not None:
+                assert d_tok_gt.shape == d_tok_pred.shape, "D_tok_gt must align with D_tok_pred."
+            warmup_steps = max(1, curriculum_pred_order_warmup_steps)
+            progress = min(float(global_step) / warmup_steps, 1.0) * curriculum_pred_order_prob_max
+            use_pred_mask = torch.rand(d_tok_pred.shape[0], device=d_tok_pred.device) < progress
+            if d_tok_gt is None:
+                d_tok_gt = torch.zeros_like(d_tok_pred)
+            order_scores = torch.where(use_pred_mask.unsqueeze(1), d_tok_pred, d_tok_gt)
+            orders = torch.argsort(order_scores.detach(), dim=1, descending=True)
+            mask_len_list = self._build_curriculum_mask_lens(num_iter, num_tokens, hr_tokens.device)
+            prev_lens = torch.cat([torch.tensor([num_tokens], device=hr_tokens.device), mask_len_list[:-1]])
+            step_idx = torch.randint(0, num_iter, (hr_tokens.size(0),), device=hr_tokens.device)
+            prev_len = prev_lens.gather(0, step_idx)
+            next_lens = mask_len_list.gather(0, step_idx)
+            ranks = torch.zeros_like(orders)
+            rank_indices = torch.arange(num_tokens, device=hr_tokens.device).unsqueeze(0).expand_as(orders)
+            ranks.scatter_(1, orders, rank_indices)
+            mask_prev = (ranks < prev_len.unsqueeze(1)).float()
+            mask_next = (ranks < next_lens.unsqueeze(1)).float()
+            loss_mask = torch.logical_xor(mask_prev.bool(), mask_next.bool()).float()
+            is_last_step = (step_idx == num_iter - 1).unsqueeze(1)
+            loss_mask = torch.where(is_last_step, mask_prev.bool(), loss_mask.bool()).float()
+            mask = mask_prev
+        else:
+            # 生成随机掩码
+            orders = self.sample_orders(bsz=hr_tokens.size(0), num_tokens = num_tokens)
+            mask = self.random_masking(hr_tokens, orders)
+            loss_mask = mask
         cond_tokens_encoder = None
         cond_tokens_decoder = None
         cond_kv_cache_encoder = None
@@ -851,11 +903,12 @@ class MAR(nn.Module):
         )
 
         # loss
-        loss, loss_diff, loss_mse = self.forward_loss(z=z, pos_embed=pos_embed, target=gt_latents, mask=mask)
+        loss, loss_diff, loss_mse = self.forward_loss(z=z, pos_embed=pos_embed, target=gt_latents, mask=mask, loss_mask=loss_mask)
         if self.use_deg_head:
-            d_tok_pred = self.degradation_head(z).squeeze(-1)
-            if self.deg_use_sigmoid:
-                d_tok_pred = torch.sigmoid(d_tok_pred)
+            if not (self.training and curriculum_decode):
+                d_tok_pred = self.degradation_head(z).squeeze(-1)
+                if self.deg_use_sigmoid:
+                    d_tok_pred = torch.sigmoid(d_tok_pred)
             assert d_tok_pred.shape[1] == gt_latents.shape[1], "D_tok_pred shape mismatch with token count."
             return loss, loss_diff, loss_mse, d_tok_pred
         
@@ -922,6 +975,9 @@ class MAR(nn.Module):
         indices = list(range(num_iter))
         if progress:
             indices = tqdm(indices)
+        mask_len_list = None
+        if curriculum_decode:
+            mask_len_list = self._build_curriculum_mask_lens(num_iter, num_hr_tokens, mask.device)
         prev_mask_len = None
         # generate latents
         for step in indices:
@@ -942,15 +998,14 @@ class MAR(nn.Module):
                 gate_multiplier=gate_multiplier
             )
 
-            # mask ratio for the next round, following MaskGIT and MAGE.
-            mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
-            #mask_len = torch.Tensor([np.floor(self.seq_len * mask_ratio)]).cuda()
-            mask_len = torch.Tensor([np.floor(num_hr_tokens * mask_ratio)]).cuda()
-
-            # masks out at least one for the next iteration
-            mask_len = torch.maximum(torch.Tensor([1]).cuda(),
-                                     torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len))
-            if prev_mask_len is not None:
+            if mask_len_list is not None:
+                mask_len = mask_len_list[step].unsqueeze(0).float()
+            else:
+                mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
+                mask_len = torch.Tensor([np.floor(num_hr_tokens * mask_ratio)]).cuda()
+                mask_len = torch.maximum(torch.Tensor([1]).cuda(),
+                                         torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len))
+            if prev_mask_len is not None and mask_len_list is None:
                 assert mask_len[0] <= prev_mask_len + 1e-6, "Mask length must be non-increasing."
             prev_mask_len = mask_len[0]
             # get masking for next iteration and locations to be predicted in this iteration
@@ -997,8 +1052,8 @@ class MAR(nn.Module):
 
 def mar_base(**kwargs):
     model = MAR(
-        encoder_embed_dim=768, encoder_depth=8, encoder_num_heads=8,
-        decoder_embed_dim=768, decoder_depth=8, decoder_num_heads=8,
+        encoder_embed_dim=768, encoder_depth=12, encoder_num_heads=12,
+        decoder_embed_dim=768, decoder_depth=12, decoder_num_heads=12,
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 

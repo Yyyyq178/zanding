@@ -10,7 +10,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --vae_stride 16 \
     --patch_size 1 \
     --batch_size 1 \
-    --eval_bsz 4 \
+    --eval_bsz 8 \
     --img_size 512 \
     --resume output_sr_train_10:2:1_inject \
     --evaluate \
@@ -23,5 +23,5 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --use_rope \
     --use_mse_loss \
     --curriculum_decode \
-    --output_dir output_zanding
+    --output_dir output_zanding_order
 

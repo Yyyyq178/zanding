@@ -2,10 +2,10 @@ import os
 
 # ================= 配置区域 =================
 # 请在这里填入你需要修改图片名字的文件夹路径
-target_folder = '/root/autodl-tmp/zanding/CelebA-Test-3000/DiffBIR_SR'
+target_folder = '/root/autodl-tmp/zanding/output_zanding_order/ariter64-diffstepsddim100-temp1.0-linearcfg1.0-image_num70000_ema_evaluate/sr_images'
 # ===========================================
 
-def remove_suffix():
+def remove_prefix():
     # 1. 检查文件夹是否存在
     if not os.path.exists(target_folder):
         print(f"错误：找不到文件夹路径：{target_folder}")
@@ -22,13 +22,14 @@ def remove_suffix():
         if not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp')):
             continue
             
-        # 分离文件名和后缀。例如 '6_0.png' -> name='6_0', ext='.png'
+        # 分离文件名和后缀。例如 'rank0_6.png' -> name='rank0_6', ext='.png'
         name, ext = os.path.splitext(filename)
         
-        # 核心逻辑：如果文件名以 '_0' 结尾
-        if name.endswith('_0'):
-            # 去掉最后2个字符（即去掉 '_0'）
-            new_name_stem = name[:-2]
+        # --- 修改部分开始 ---
+        # 核心逻辑：检查文件名是否以 'rank0_' 开头
+        if name.startswith('rank0_'):
+            # 去掉前6个字符（即去掉 'rank0_'，因为 rank0_ 长度为6）
+            new_name_stem = name[6:]
             
             # 组合新名字。例如 '6' + '.png' -> '6.png'
             new_filename = new_name_stem + ext
@@ -45,9 +46,10 @@ def remove_suffix():
             os.rename(old_path, new_path)
             print(f"[成功] {filename} -> {new_filename}")
             count += 1
+        # --- 修改部分结束 ---
             
     print("-" * 30)
     print(f"全部完成！共重命名了 {count} 张图片。")
 
 if __name__ == '__main__':
-    remove_suffix()
+    remove_prefix()

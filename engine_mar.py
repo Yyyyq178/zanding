@@ -101,29 +101,41 @@ def train_one_epoch(model, vae,
                 posterior_hr = vae.encode(samples_hr)
                 x_hr = posterior_hr.sample().mul_(0.2325) 
 
-                # === 编码 LR ===
-                posterior_lr = vae.encode(samples_lr)
-                x_lr = posterior_lr.sample().mul_(0.2325)
+        # === 编码 LR ===
+        posterior_lr = vae.encode(samples_lr)
+        x_lr = posterior_lr.sample().mul_(0.2325)
 
-        gate_multiplier = 1.0
+    gate_multiplier = 1.0
+    num_iter = args.decode_steps if (args.curriculum_decode and args.decode_steps is not None) else args.num_iter
+    global_step_offset = epoch * num_steps_per_epoch
+    d_tok_gt = None
+    if args.use_deg_head:
+        d_pix_gt = build_degradation_map(samples_hr, samples_lr, args.deg_w_pix, args.deg_w_grad)
+        d_tok_gt = pool_degradation_to_tokens(d_pix_gt, model)
 
-        # forward
-        with torch.amp.autocast('cuda'):
-            # 传入模型
-            model_out = model(x_hr, x_lr, gate_multiplier=gate_multiplier)
-            if args.use_deg_head:
-                loss, loss_diff, loss_mse, d_tok_pred = model_out
-            else:
-                loss, loss_diff, loss_mse = model_out
-                d_tok_pred = None
+    # forward
+    with torch.amp.autocast('cuda'):
+        # 传入模型
+        model_out = model(
+            x_hr, x_lr, gate_multiplier=gate_multiplier,
+            curriculum_decode=args.curriculum_decode,
+            num_iter=num_iter,
+            d_tok_gt=d_tok_gt,
+            global_step=global_step_offset + data_iter_step,
+            curriculum_pred_order_warmup_steps=args.curriculum_pred_order_warmup_steps,
+            curriculum_pred_order_prob_max=args.curriculum_pred_order_prob_max,
+        )
+        if args.use_deg_head:
+            loss, loss_diff, loss_mse, d_tok_pred = model_out
+        else:
+            loss, loss_diff, loss_mse = model_out
+            d_tok_pred = None
 
-            if args.use_deg_head:
-                d_pix_gt = build_degradation_map(samples_hr, samples_lr, args.deg_w_pix, args.deg_w_grad)
-                d_tok_gt = pool_degradation_to_tokens(d_pix_gt, model)
-                assert d_tok_pred is not None, "D_tok_pred must be returned when use_deg_head is enabled."
-                assert d_tok_pred.shape == d_tok_gt.shape, "D_tok_gt must align with D_tok_pred."
-                loss_deg = F.l1_loss(d_tok_pred, d_tok_gt)
-                loss = loss + args.lambda_deg * loss_deg
+        if args.use_deg_head:
+            assert d_tok_pred is not None, "D_tok_pred must be returned when use_deg_head is enabled."
+            assert d_tok_pred.shape == d_tok_gt.shape, "D_tok_gt must align with D_tok_pred."
+            loss_deg = F.l1_loss(d_tok_pred, d_tok_gt)
+            loss = loss + args.lambda_deg * loss_deg
 
         loss_value = loss.item()
 

@@ -117,6 +117,10 @@ def get_args_parser():
     parser.add_argument('--deg_use_sigmoid', action='store_true', help='Apply sigmoid to degradation head output')
     parser.add_argument('--curriculum_decode', action='store_true', help='Enable hard-order curriculum decoding')
     parser.add_argument('--decode_steps', default=None, type=int, help='Override decoding steps for curriculum')
+    parser.add_argument('--curriculum_pred_order_warmup_steps', default=2000, type=int,
+                        help='Warmup steps for curriculum order prediction probability')
+    parser.add_argument('--curriculum_pred_order_prob_max', default=1.0, type=float,
+                        help='Maximum probability of using predicted order during warmup')
     parser.add_argument('--use_rope', action='store_true',
                         help='Use 2D RoPE; default is absolute positional embeddings')
     parser.add_argument('--use_mse_loss', action='store_true',
@@ -180,6 +184,8 @@ def main(args):
     seed = args.seed + misc.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
+    if args.curriculum_decode and not args.use_deg_head:
+        raise ValueError("curriculum_decode requires degradation head enabled (use_deg_head=True).")
 
     cudnn.benchmark = True
 
