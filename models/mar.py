@@ -563,7 +563,7 @@ class MAR(nn.Module):
             # 只有在没传 shape 时，才尝试去猜（回退到训练时的固定形状）
             h_, w_ = self.seq_h, self.seq_w
 
-        # (可选) 校验一下是否匹配
+        # 校验一下是否匹配
         # assert h_ * w_ == x.shape[1], f"Shape mismatch: tokens={x.shape[1]}, target={h_}x{w_}"
 
         x = x.reshape(bsz, h_, w_, c, p, p)
@@ -605,7 +605,6 @@ class MAR(nn.Module):
         h_hr, w_hr = shape_hr
         h_lr, w_lr = shape_lr
         
-        # 1. 生成归一化坐标 (类似 VARSR 使用 meshgrid)
         # 使用 self.seq_h 作为 base_size 进行归一化，保持尺度一致性
         base_size = self.seq_h
         
@@ -627,7 +626,7 @@ class MAR(nn.Module):
         coords_h = torch.cat([coords_h_lr, coords_h_hr], dim=0)
         coords_w = torch.cat([coords_w_lr, coords_w_hr], dim=0)
 
-        # 2. 计算频率 (调用第一步定义的函数)
+        # 计算频率 (调用第一步定义的函数)
         freqs_cis = precompute_freqs_cis_2d(head_dim, coords_h, coords_w)
         
         # 增加 Batch 维度 [L, D//2]
@@ -756,8 +755,6 @@ class MAR(nn.Module):
         # 移除 Buffer (LR tokens)
         x = x[:, num_lr_tokens:]
 
-        # [修正] 必须为 DiffLoss 加回绝对位置编码！
-        # 这里需要调用你之前删掉的 get_2d_sincos_pos_embed_torch 函数
         # 使用 self.seq_h 作为 base_size 保持一致性
         pos_embed = get_2d_sincos_pos_embed_torch(
             self.decoder_embed.out_features, shape_hr, shape_lr, x.device, base_size=self.seq_h
@@ -813,15 +810,7 @@ class MAR(nn.Module):
     def forward(self, x_hr, x_lr, gate_multiplier=1.0, curriculum_decode: bool = False, num_iter: int = None,
                 d_tok_gt: torch.Tensor = None, global_step: int = 0,
                 curriculum_pred_order_warmup_steps: int = 2000, curriculum_pred_order_prob_max: float = 1.0):
-        # x_hr: HR Latents [B, 16, 16, 16]
-        # x_lr: LR Latents [B, 16, 32, 32]
-        # class embed
-        #class_embedding = self.class_emb(x_lr)
 
-        # 显式获取 Latent 的真实高宽
-        # 这就是支持长方形输入的关键：不再假设 H=W
-        #_, _, h_hr, w_hr = x_hr.shape
-        #_, _, h_lr, w_lr = x_lr.shape
         shape_hr = (self.seq_h, self.seq_w)
         shape_lr = (self.seq_h, self.seq_w)
 
@@ -839,38 +828,46 @@ class MAR(nn.Module):
                 raise ValueError("curriculum_decode requires use_deg_head=True.")
             if num_iter is None:
                 raise ValueError("num_iter must be provided when curriculum_decode is enabled during training.")
-            deg_features = self.decoder_embed(self.z_proj_ln(self.z_proj(hr_tokens)))
-            d_tok_pred = self.degradation_head(deg_features).squeeze(-1)
-            if self.deg_use_sigmoid:
-                d_tok_pred = torch.sigmoid(d_tok_pred)
-            if d_tok_gt is not None:
-                assert d_tok_gt.shape == d_tok_pred.shape, "D_tok_gt must align with D_tok_pred."
-            warmup_steps = max(1, curriculum_pred_order_warmup_steps)
-            progress = min(float(global_step) / warmup_steps, 1.0) * curriculum_pred_order_prob_max
-            use_pred_mask = torch.rand(d_tok_pred.shape[0], device=d_tok_pred.device) < progress
-            if d_tok_gt is None:
-                d_tok_gt = torch.zeros_like(d_tok_pred)
-            order_scores = torch.where(use_pred_mask.unsqueeze(1), d_tok_pred, d_tok_gt)
-            orders = torch.argsort(order_scores.detach(), dim=1, descending=True)
+            
+            # 使用模型自己的退化头来评估 HR Token 的难度
+            # 这里使用 torch.no_grad() 是因为我们只用这个分数来排序(产生索引)，不需要对排序过程反向传播
+            with torch.no_grad():
+                # 即使是 HR Token，经过退化头也能得出一个“复杂度/难度”分数
+                # 模型会认为纹理复杂的地方分数高(难)，平坦的地方分数低(易)
+                deg_features_hr = self.decoder_embed(self.z_proj_ln(self.z_proj(hr_tokens)))
+                d_tok_pred_hr = self.degradation_head(deg_features_hr).squeeze(-1)
+                if self.deg_use_sigmoid:
+                    d_tok_pred_hr = torch.sigmoid(d_tok_pred_hr)
+            
+            # 严格对齐：完全依据模型预测的分数进行排序
+            # 分数高(难)的排前面 -> 优先被 Mask
+            # 彻底移除了 d_tok_gt 参与排序的逻辑，也不再需要 Warmup
+            orders = torch.argsort(d_tok_pred_hr, dim=1, descending=True)
+            
+            # 计算 Mask 边界 
             mask_len_list = self._build_curriculum_mask_lens(num_iter, num_tokens, hr_tokens.device)
             prev_lens = torch.cat([torch.tensor([num_tokens], device=hr_tokens.device), mask_len_list[:-1]])
             step_idx = torch.randint(0, num_iter, (hr_tokens.size(0),), device=hr_tokens.device)
             prev_len = prev_lens.gather(0, step_idx)
             next_lens = mask_len_list.gather(0, step_idx)
+            
             ranks = torch.zeros_like(orders)
             rank_indices = torch.arange(num_tokens, device=hr_tokens.device).unsqueeze(0).expand_as(orders)
             ranks.scatter_(1, orders, rank_indices)
+            
             mask_prev = (ranks < prev_len.unsqueeze(1)).float()
             mask_next = (ranks < next_lens.unsqueeze(1)).float()
+            
             loss_mask = torch.logical_xor(mask_prev.bool(), mask_next.bool()).float()
             is_last_step = (step_idx == num_iter - 1).unsqueeze(1)
             loss_mask = torch.where(is_last_step, mask_prev.bool(), loss_mask.bool()).float()
             mask = mask_prev
         else:
-            # 生成随机掩码
-            orders = self.sample_orders(bsz=hr_tokens.size(0), num_tokens = num_tokens)
+            # 随机 Mask 逻辑
+            orders = self.sample_orders(bsz=hr_tokens.size(0), num_tokens=num_tokens)
             mask = self.random_masking(hr_tokens, orders)
             loss_mask = mask
+
         cond_tokens_encoder = None
         cond_tokens_decoder = None
         cond_kv_cache_encoder = None
@@ -905,11 +902,16 @@ class MAR(nn.Module):
         # loss
         loss, loss_diff, loss_mse = self.forward_loss(z=z, pos_embed=pos_embed, target=gt_latents, mask=mask, loss_mask=loss_mask)
         if self.use_deg_head:
-            if not (self.training and curriculum_decode):
-                d_tok_pred = self.degradation_head(z).squeeze(-1)
-                if self.deg_use_sigmoid:
-                    d_tok_pred = torch.sigmoid(d_tok_pred)
+            # 无论是否 curriculum_decode，都统一使用 Decoder 的输出 z 来计算 Loss
+            # 这保证了 degradation_head 学习的是评估“生成的z”和“真实难度”之间的关系
+            d_tok_pred = self.degradation_head(z).squeeze(-1)
+            
+            if self.deg_use_sigmoid:
+                d_tok_pred = torch.sigmoid(d_tok_pred)
+                
             assert d_tok_pred.shape[1] == gt_latents.shape[1], "D_tok_pred shape mismatch with token count."
+            
+            # 返回这个预测值给 engine，engine 会拿它和 d_tok_gt 做 Loss
             return loss, loss_diff, loss_mse, d_tok_pred
         
         return loss, loss_diff, loss_mse
