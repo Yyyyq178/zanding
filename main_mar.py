@@ -57,8 +57,6 @@ def get_args_parser():
                         help='number of autoregressive iterations to generate an image')
     parser.add_argument('--num_images', default=70000, type=int,
                         help='number of images to generate')
-    parser.add_argument('--cfg', default=1.0, type=float, help="classifier-free guidance")
-    parser.add_argument('--cfg_schedule', default="linear", type=str)
     #parser.add_argument('--label_drop_prob', default=0.1, type=float)
     parser.add_argument('--eval_freq', type=int, default=40, help='evaluation frequency')
     parser.add_argument('--save_last_freq', type=int, default=5, help='save last frequency')
@@ -433,7 +431,7 @@ def main(args):
     if args.evaluate:
         torch.cuda.empty_cache()
         evaluate(model_without_ddp, vae, ema_params, args, 0, batch_size=args.eval_bsz, log_writer=log_writer,
-                 cfg=args.cfg, use_ema=True, data_loader=data_loader_val, paired_mode=args.paired_test,
+                 use_ema=True, data_loader=data_loader_val, paired_mode=args.paired_test,
                  swinir_model=swinir_model)
         return
 
@@ -463,12 +461,9 @@ def main(args):
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
             evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=args.eval_bsz, log_writer=log_writer,
-                     cfg=1.0, use_ema=True, data_loader=data_loader_val
+                     use_ema=True, data_loader=data_loader_val
                      , swinir_model=swinir_model
                      )
-            if not (args.cfg == 1.0 or args.cfg == 0.0):
-                evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=args.eval_bsz // 2,
-                         log_writer=log_writer, cfg=args.cfg, use_ema=True, swinir_model=swinir_model)
             torch.cuda.empty_cache()
 
         if misc.is_main_process():

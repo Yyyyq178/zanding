@@ -33,17 +33,11 @@ class DiffLoss(nn.Module):
             loss = (loss * mask).sum() / mask.sum()
         return loss.mean()
 
-    def sample(self, z, temperature=1.0, cfg=1.0):
-        # diffusion loss sampling
-        if not cfg == 1.0:
-            noise = torch.randn(z.shape[0] // 2, self.in_channels).cuda()
-            noise = torch.cat([noise, noise], dim=0)
-            model_kwargs = dict(c=z, cfg_scale=cfg)
-            sample_fn = self.net.forward_with_cfg
-        else:
-            noise = torch.randn(z.shape[0], self.in_channels).cuda()
-            model_kwargs = dict(c=z)
-            sample_fn = self.net.forward
+    def sample(self, z, temperature=1.0):
+        # diffusion loss sampling without CFG (standard forward)
+        noise = torch.randn(z.shape[0], self.in_channels).cuda()
+        model_kwargs = dict(c=z)
+        sample_fn = self.net.forward
 
         sampled_token_latent = self.gen_diffusion.p_sample_loop(
             sample_fn, noise.shape, noise, clip_denoised=False, model_kwargs=model_kwargs, progress=False,
@@ -239,13 +233,3 @@ class SimpleMLPAdaLN(nn.Module):
                 x = block(x, y)
 
         return self.final_layer(x, y)
-
-    def forward_with_cfg(self, x, t, c, cfg_scale):
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, c)
-        eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)

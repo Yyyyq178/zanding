@@ -118,27 +118,25 @@ class CrossAttention(nn.Module):
         return k, v
 
     def forward(self, x: torch.Tensor, cond_tokens: Optional[torch.Tensor] = None,
-                cond_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 freqs_cis_q: Optional[torch.Tensor] = None,
                 freqs_cis_k: Optional[torch.Tensor] = None) -> torch.Tensor:
         bsz, seq_len, dim = x.shape
         q = self.q(x).reshape(bsz, seq_len, self.num_heads, dim // self.num_heads).transpose(1, 2)
 
-        if cond_kv is None:
-            if cond_tokens is None:
-                raise ValueError("cond_tokens must be provided when cond_kv is None.")
-            k, v = self.project_kv(cond_tokens)
-        else:
-            k, v = cond_kv
+        if cond_tokens is None:
+            raise ValueError("cond_tokens must be provided for cross attention.")
+        k, v = self.project_kv(cond_tokens)
 
         if freqs_cis_q is not None:
             q = q.transpose(1, 2)
             q, _ = apply_rotary_emb(q, q, freqs_cis_q)
             q = q.transpose(1, 2)
+
         if freqs_cis_k is not None:
             k = k.transpose(1, 2)
             k, _ = apply_rotary_emb(k, k, freqs_cis_k)
             k = k.transpose(1, 2)
+
         dropout_p = self.attn_drop.p if self.training else 0.0
         attn_out = F.scaled_dot_product_attention(
             q, k, v,
@@ -176,7 +174,7 @@ class RoPEBlock(nn.Module):
             self.norm_cross = None
             self.lr_inject_gate = None
             
-    def forward(self, x, freqs_cis=None, cond_tokens=None, cond_kv=None, gate_multiplier=1.0,
+    def forward(self, x, freqs_cis=None, cond_tokens=None, gate_multiplier=1.0,
                 cross_attn_freqs_q=None, cross_attn_freqs_k=None):
         # 将 freqs_cis 传入 Attention
         x = x + self.drop_path(self.attn(self.norm1(x), freqs_cis=freqs_cis))
@@ -187,7 +185,6 @@ class RoPEBlock(nn.Module):
             cross_out = self.cross_attn(
                 self.norm_cross(x),
                 cond_tokens=cond_tokens,
-                cond_kv=cond_kv,
                 freqs_cis_q=cross_attn_freqs_q,
                 freqs_cis_k=cross_attn_freqs_k
             )
@@ -494,16 +491,6 @@ class MAR(nn.Module):
                 raise ValueError(f"Unsupported lr_inject_cond_source: {self.lr_inject_cond_source}")
         return cond_tokens
 
-    @staticmethod
-    def _build_lr_inject_kv_cache(cond_tokens: torch.Tensor, blocks: nn.ModuleList):
-        kv_cache = []
-        for block in blocks:
-            if getattr(block, "cross_attn", None) is not None:
-                kv_cache.append(block.cross_attn.project_kv(cond_tokens))
-            else:
-                kv_cache.append(None)
-        return kv_cache
-
     def get_lr_inject_gate_mean(self) -> float:
         if not self.use_lr_inject:
             return 0.0
@@ -623,7 +610,7 @@ class MAR(nn.Module):
         return freqs_cis
     
     def forward_mae_encoder(self, x_hr, mask, x_lr, shape_hr, shape_lr,
-                            cond_tokens=None, cond_kv_cache=None, gate_multiplier=1.0):
+                            cond_tokens=None, gate_multiplier=1.0):
         # x: [Batch, Seq_Len=256, Dim=16] (VAE 输出的 token)
         # mask: [Batch, Seq_Len=256] (0=可见, 1=遮挡)
         # x_lr: LR tokens（来自VAE编码，维度 16）
@@ -673,24 +660,23 @@ class MAR(nn.Module):
             assert cond_tokens.shape[0] == x.shape[0], "cond_tokens batch mismatch with encoder tokens."
             assert cond_tokens.shape[-1] == embed_dim, "cond_tokens dim mismatch with encoder embed dim."
         for idx, block in enumerate(self.encoder_blocks):
-            cond_kv = cond_kv_cache[idx] if cond_kv_cache is not None else None
             if self.grad_checkpointing and not torch.jit.is_scripting():         
                 # [修改] 传入 freqs_cis=freqs_cis_kept
                 gate_multiplier_tensor = x.new_tensor(gate_multiplier)
                 x = checkpoint(
-                    block, x, freqs_cis_kept, cond_tokens, cond_kv, gate_multiplier_tensor,
+                    block, x, freqs_cis_kept, cond_tokens, gate_multiplier_tensor,
                     freqs_cis_kept, freqs_cis_lr
                 )
             else:
                 x = block(x, freqs_cis=freqs_cis_kept, cond_tokens=cond_tokens,
-                          cond_kv=cond_kv, gate_multiplier=gate_multiplier,
+                          gate_multiplier=gate_multiplier,
                           cross_attn_freqs_q=freqs_cis_kept, cross_attn_freqs_k=freqs_cis_lr)
         x = self.encoder_norm(x)
 
         return x
 
     def forward_mae_decoder(self, x, mask, shape_hr, shape_lr,
-                            cond_tokens=None, cond_kv_cache=None, gate_multiplier=1.0):
+                            cond_tokens=None, gate_multiplier=1.0):
         x = self.decoder_embed(x)
         num_lr_tokens = shape_lr[0] * shape_lr[1]
         bsz = x.shape[0]
@@ -727,17 +713,15 @@ class MAR(nn.Module):
         if self.grad_checkpointing and not torch.jit.is_scripting():
             for idx, block in enumerate(self.decoder_blocks):
                 # [修改] 传入 freqs_cis
-                cond_kv = cond_kv_cache[idx] if cond_kv_cache is not None else None
                 gate_multiplier_tensor = x.new_tensor(gate_multiplier)
                 x = checkpoint(
-                    block, x, freqs_cis_full, cond_tokens, cond_kv, gate_multiplier_tensor,
+                    block, x, freqs_cis_full, cond_tokens, gate_multiplier_tensor,
                     freqs_cis_full, freqs_cis_full[:, :num_lr_tokens] if freqs_cis_full is not None else None
                 )
         else:
             for idx, block in enumerate(self.decoder_blocks):
-                cond_kv = cond_kv_cache[idx] if cond_kv_cache is not None else None
                 x = block(x, freqs_cis=freqs_cis_full, cond_tokens=cond_tokens,
-                          cond_kv=cond_kv, gate_multiplier=gate_multiplier,
+                          gate_multiplier=gate_multiplier,
                           cross_attn_freqs_q=freqs_cis_full,
                           cross_attn_freqs_k=freqs_cis_full[:, :num_lr_tokens] if freqs_cis_full is not None else None)
         x = self.decoder_norm(x)
@@ -799,8 +783,6 @@ class MAR(nn.Module):
         mask = self.random_masking(hr_tokens, orders)
         cond_tokens_encoder = None
         cond_tokens_decoder = None
-        cond_kv_cache_encoder = None
-        cond_kv_cache_decoder = None
         if self.use_lr_inject:
             cond_tokens_base = self._build_lr_inject_cond_tokens(x_lr, lr_tokens=lr_tokens)
             cond_tokens_encoder = self.lr_inject_cond_proj_encoder(cond_tokens_base)
@@ -810,21 +792,17 @@ class MAR(nn.Module):
                 lr_pos_dec = self.lr_pos_embed_decoder[:, : cond_tokens_decoder.shape[1], :]
                 cond_tokens_encoder = cond_tokens_encoder + lr_pos_enc
                 cond_tokens_decoder = cond_tokens_decoder + lr_pos_dec
-            cond_kv_cache_encoder = self._build_lr_inject_kv_cache(cond_tokens_encoder, self.encoder_blocks)
-            cond_kv_cache_decoder = self._build_lr_inject_kv_cache(cond_tokens_decoder, self.decoder_blocks)
 
         # mae encoder
         x = self.forward_mae_encoder(
             hr_tokens, mask, lr_tokens, shape_hr, shape_lr,
             cond_tokens=cond_tokens_encoder,
-            cond_kv_cache=cond_kv_cache_encoder,
             gate_multiplier=gate_multiplier
         )
         # mae decoder
         z, pos_embed  = self.forward_mae_decoder(
             x, mask, shape_hr, shape_lr,
             cond_tokens=cond_tokens_decoder,
-            cond_kv_cache=cond_kv_cache_decoder,
             gate_multiplier=gate_multiplier
         )
 
@@ -833,7 +811,7 @@ class MAR(nn.Module):
         
         return loss, loss_diff, loss_mse
         
-    def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", x_lr=None,
+    def sample_tokens(self, bsz, num_iter=64, x_lr=None,
                       temperature=1.0, progress=False,
                       gate_multiplier=1.0):
         # 必须有 LR 输入
@@ -848,8 +826,6 @@ class MAR(nn.Module):
         lr_tokens = self.patchify(x_lr)
         cond_tokens_encoder = None
         cond_tokens_decoder = None
-        cond_kv_cache_encoder = None
-        cond_kv_cache_decoder = None
         if self.use_lr_inject:
             cond_tokens_base = self._build_lr_inject_cond_tokens(x_lr, lr_tokens=lr_tokens)
             cond_tokens_encoder = self.lr_inject_cond_proj_encoder(cond_tokens_base)
@@ -859,8 +835,7 @@ class MAR(nn.Module):
                 lr_pos_dec = self.lr_pos_embed_decoder[:, : cond_tokens_decoder.shape[1], :]
                 cond_tokens_encoder = cond_tokens_encoder + lr_pos_enc
                 cond_tokens_decoder = cond_tokens_decoder + lr_pos_dec
-            cond_kv_cache_encoder = self._build_lr_inject_kv_cache(cond_tokens_encoder, self.encoder_blocks)
-            cond_kv_cache_decoder = self._build_lr_inject_kv_cache(cond_tokens_decoder, self.decoder_blocks)
+
         # init and sample generation orders
         # 初始化掩码：全为 1 (代表全图被遮挡/未知)
         mask = torch.ones(bsz, num_hr_tokens).cuda()
@@ -881,7 +856,6 @@ class MAR(nn.Module):
             x = self.forward_mae_encoder(
                 tokens, mask, lr_tokens, shape_hr, shape_lr,
                 cond_tokens=cond_tokens_encoder,
-                cond_kv_cache=cond_kv_cache_encoder,
                 gate_multiplier=gate_multiplier
             )
             
@@ -889,7 +863,6 @@ class MAR(nn.Module):
             z, pos_embed = self.forward_mae_decoder(
                 x, mask, shape_hr, shape_lr,
                 cond_tokens=cond_tokens_decoder,
-                cond_kv_cache=cond_kv_cache_decoder,
                 gate_multiplier=gate_multiplier
             )
 
@@ -912,9 +885,6 @@ class MAR(nn.Module):
             else:
                 mask_to_pred = torch.logical_xor(mask[:bsz].bool(), mask_next.bool())
             mask = mask_next
-            if not cfg == 1.0:
-                mask_to_pred = torch.cat([mask_to_pred, mask_to_pred], dim=0)
-
 
             # sample token latents for this step
             indices_to_pred = mask_to_pred.nonzero(as_tuple=True)
@@ -923,20 +893,7 @@ class MAR(nn.Module):
             pos_sub = pos_embed[indices_to_pred]
             z_cond = z_sub + pos_sub
             
-            # cfg schedule follow Muse
-            if cfg_schedule == "linear":
-                cfg_iter = 1 + (cfg - 1) * (num_hr_tokens - mask_len[0]) / num_hr_tokens
-            elif cfg_schedule == "constant":
-                cfg_iter = cfg
-            else:
-                raise NotImplementedError
-            sampled_token_latent = self.diffloss.sample(z_cond, temperature, cfg_iter)
-
-            if not cfg == 1.0:
-                sampled_token_latent, _ = sampled_token_latent.chunk(2, dim=0)  # Remove null class samples
-                mask_to_pred, _ = mask_to_pred.chunk(2, dim=0)
-            #z = self.final_proj(z)
-            #sampled_token_latent = z
+            sampled_token_latent = self.diffloss.sample(z_cond, temperature)
 
             cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
             tokens = cur_tokens.clone()
