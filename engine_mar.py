@@ -67,63 +67,71 @@ def train_one_epoch(model, vae,
 
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
-    
+
     num_steps_per_epoch = len(data_loader)
     if args.steps_per_epoch > 0 and args.steps_per_epoch < len(data_loader):
         num_steps_per_epoch = args.steps_per_epoch
 
     degradation_model = CodeFormerDegradation()
-        
+
+    gate_multiplier = 1.0
+    num_iter = args.decode_steps if (args.curriculum_decode and args.decode_steps is not None) else args.num_iter
+    global_step_offset = epoch * num_steps_per_epoch
 
     for data_iter_step, (samples_hr, samples_lr, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
-        # 如果当前步数达到了我们设定的限制，直接强行结束这一轮，进入 Validation
         if args.steps_per_epoch > 0 and data_iter_step >= args.steps_per_epoch:
             break
-        #torch.cuda.empty_cache()
 
-        # we use a per iteration (instead of per epoch) lr scheduler
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / num_steps_per_epoch + epoch, args)
 
-        # 把数据移到 GPU
         samples_hr = samples_hr.to(device, non_blocking=True)
 
         samples_lr = degradation_model(samples_hr, scale=None)
+        samples_lr = samples_lr.to(device, non_blocking=True)
 
         if swinir_model is not None:
             samples_lr = preprocess_with_swinir(samples_lr, swinir_model, args.swinir_batch)
 
         with torch.no_grad():
             if args.use_cached:
-                 raise NotImplementedError("Cached mode not supported for SR yet.")
-            else:
-                # === 编码 HR ===
-                posterior_hr = vae.encode(samples_hr)
-                x_hr = posterior_hr.sample().mul_(0.2325) 
+                raise NotImplementedError("Cached mode not supported for SR yet.")
+            posterior_hr = vae.encode(samples_hr)
+            x_hr = posterior_hr.sample().mul_(0.2325)
 
-                # === 编码 LR ===
-                posterior_lr = vae.encode(samples_lr)
-                x_lr = posterior_lr.sample().mul_(0.2325)
+            posterior_lr = vae.encode(samples_lr)
+            x_lr = posterior_lr.sample().mul_(0.2325)
 
-        gate_multiplier = 1.0
+        d_tok_gt = None
+        if args.use_deg_head:
+            d_pix_gt = build_degradation_map(samples_hr, samples_lr, args.deg_w_pix, args.deg_w_grad)
+            d_tok_gt = pool_degradation_to_tokens(d_pix_gt, model)
 
-        # forward
         with torch.amp.autocast('cuda'):
-            # 传入模型
-            model_out = model(x_hr, x_lr, gate_multiplier=gate_multiplier)
-
-            loss, loss_diff, loss_mse = model_out
-            d_tok_pred = None
+            model_out = model(
+                x_hr, x_lr, gate_multiplier=gate_multiplier,
+                curriculum_decode=args.curriculum_decode,
+                num_iter=num_iter,
+                d_tok_gt=d_tok_gt,
+                global_step=global_step_offset + data_iter_step,
+                curriculum_pred_order_warmup_steps=args.curriculum_pred_order_warmup_steps,
+                curriculum_pred_order_prob_max=args.curriculum_pred_order_prob_max,
+            )
 
             if args.use_deg_head:
-                d_pix_gt = build_degradation_map(samples_hr, samples_lr, args.deg_w_pix, args.deg_w_grad)
-                d_tok_gt = pool_degradation_to_tokens(d_pix_gt, model)
-                assert d_tok_pred is not None, "D_tok_pred must be returned when use_deg_head is enabled."
-                assert d_tok_pred.shape == d_tok_gt.shape, "D_tok_gt must align with D_tok_pred."
+                loss, loss_diff, loss_mse, d_tok_pred = model_out
+            else:
+                loss, loss_diff, loss_mse = model_out
+                d_tok_pred = None
+
+            if args.use_deg_head:
+                assert d_tok_pred is not None
+                d_tok_gt = d_tok_gt.to(d_tok_pred.device)
+                assert d_tok_pred.shape == d_tok_gt.shape
                 loss_deg = F.l1_loss(d_tok_pred, d_tok_gt)
                 loss = loss + args.lambda_deg * loss_deg
 
-        loss_value = loss.item()
+            loss_value = loss.item()
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
@@ -132,19 +140,18 @@ def train_one_epoch(model, vae,
         loss_scaler(loss, optimizer, clip_grad=args.grad_clip, parameters=model.parameters(), update_grad=True)
         optimizer.zero_grad()
 
-        #torch.cuda.synchronize()
-
         update_ema(ema_params, model_params, rate=args.ema_rate)
 
         metric_logger.update(loss=loss_value)
-
         metric_logger.update(loss_diff=loss_diff.item())
         metric_logger.update(loss_mse=loss_mse.item())
+
         if args.use_lr_inject:
             model_ref = model.module if hasattr(model, "module") else model
             gate_mean = model_ref.get_lr_inject_gate_mean()
             metric_logger.update(lr_inject_gate_mean=gate_mean)
             metric_logger.update(lr_inject_gate_multiplier=gate_multiplier)
+
         if args.use_deg_head:
             loss_deg_value = loss_deg.item()
             d_mean = d_tok_pred.mean().item()
@@ -156,23 +163,18 @@ def train_one_epoch(model, vae,
 
         loss_value_reduce = misc.all_reduce_mean(loss_value)
         if log_writer is not None:
-            """ We use epoch_1000x as the x-axis in tensorboard.
-            This calibrates different curves when batch size changes.
-            """
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
             log_writer.add_scalar('train_loss_diff', misc.all_reduce_mean(loss_diff.item()), epoch_1000x)
             log_writer.add_scalar('train_loss_mse', misc.all_reduce_mean(loss_mse.item()), epoch_1000x)
             log_writer.add_scalar('lr', lr, epoch_1000x)
             if args.use_lr_inject:
-                log_writer.add_scalar('train_lr_inject_gate_mean',
-                                      misc.all_reduce_mean(gate_mean), epoch_1000x)
-                log_writer.add_scalar('train_lr_inject_gate_multiplier',
-                                      misc.all_reduce_mean(gate_multiplier), epoch_1000x)
+                log_writer.add_scalar('train_lr_inject_gate_mean', misc.all_reduce_mean(gate_mean), epoch_1000x)
+                log_writer.add_scalar('train_lr_inject_gate_multiplier', misc.all_reduce_mean(gate_multiplier), epoch_1000x)
             if args.use_deg_head:
                 log_writer.add_scalar('train_loss_deg', misc.all_reduce_mean(loss_deg_value), epoch_1000x)
                 log_writer.add_scalar('train_d_tok_mean', misc.all_reduce_mean(d_mean), epoch_1000x)
-    # gather the stats from all processes
+
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
@@ -263,9 +265,9 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         imgs_lr = imgs_lr.cuda(args.device, non_blocking=True)
 
         # 为了节省时间，只跑前 5 个 batch 看效果
-        # if i >= 5: 
-        #     print("Finished 5 batches preview, stopping evaluation.")
-        #     break 
+        if i >= 5: 
+            print("Finished 5 batches preview, stopping evaluation.")
+            break 
         if not paired_mode:
             # 如果是单独运行测试脚本 (args.evaluate=True)，且不是在线验证 (args.online_eval=False)
             # 或者你可以直接简单粗暴地判断：如果是测试模式，就用随机
