@@ -18,10 +18,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --hr_data_path /root/autodl-tmp/zanding/CelebA-Test-3000/HQ \
     --lr_data_path /root/autodl-tmp/zanding/CelebA-Test-3000/LQ \
     --use_lr_inject \
-    --use_deg_head \
-    --deg_use_sigmoid \
     --use_rope \
     --use_mse_loss \
-    --curriculum_decode \
     --output_dir output_zanding
 

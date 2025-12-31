@@ -23,8 +23,6 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --evaluate \
     --hr_data_path /root/autodl-tmp/zanding/CelebA-Test-3000/HQ \
     --use_lr_inject \
-    --use_deg_head \
-    --deg_use_sigmoid \
     --output_dir output_test_hr_only
     #--use_swinir \
     #--swinir_batch 4 \

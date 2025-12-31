@@ -111,11 +111,9 @@ def train_one_epoch(model, vae,
         with torch.amp.autocast('cuda'):
             # 传入模型
             model_out = model(x_hr, x_lr, gate_multiplier=gate_multiplier)
-            if args.use_deg_head:
-                loss, loss_diff, loss_mse, d_tok_pred = model_out
-            else:
-                loss, loss_diff, loss_mse = model_out
-                d_tok_pred = None
+
+            loss, loss_diff, loss_mse = model_out
+            d_tok_pred = None
 
             if args.use_deg_head:
                 d_pix_gt = build_degradation_map(samples_hr, samples_lr, args.deg_w_pix, args.deg_w_grad)
