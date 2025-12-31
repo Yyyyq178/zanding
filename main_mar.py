@@ -109,14 +109,6 @@ def get_args_parser():
     parser.add_argument('--diffusion_batch_mul', type=int, default=1)
     parser.add_argument('--temperature', default=1.0, type=float, help='diffusion loss sampling temperature')
     
-    # Degradation head params
-    parser.add_argument('--use_deg_head', action='store_true', help='Enable degradation prediction head')
-    parser.add_argument('--lambda_deg', default=0.8, type=float, help='Weight for degradation loss')
-    parser.add_argument('--deg_w_pix', default=1.0, type=float, help='Weight for pixel residual term')
-    parser.add_argument('--deg_w_grad', default=1.0, type=float, help='Weight for Sobel gradient term')
-    parser.add_argument('--deg_use_sigmoid', action='store_true', help='Apply sigmoid to degradation head output')
-    parser.add_argument('--curriculum_decode', action='store_true', help='Enable hard-order curriculum decoding')
-    parser.add_argument('--decode_steps', default=None, type=int, help='Override decoding steps for curriculum')
     parser.add_argument('--use_rope', action='store_true',
                         help='Use 2D RoPE; default is absolute positional embeddings')
     parser.add_argument('--use_mse_loss', action='store_true',
@@ -376,8 +368,6 @@ def main(args):
         diffusion_batch_mul=args.diffusion_batch_mul,
         grad_checkpointing=args.grad_checkpointing,
         mse_weight=args.mse_weight,
-        use_deg_head=args.use_deg_head,
-        deg_use_sigmoid=args.deg_use_sigmoid,
         use_lr_inject=args.use_lr_inject,
         lr_inject_layers=args.lr_inject_layers,
         lr_inject_cond_source=args.lr_inject_cond_source,
@@ -419,7 +409,9 @@ def main(args):
     # resume training
     if args.resume and os.path.exists(os.path.join(args.resume, "checkpoint-last.pth")):
         checkpoint = torch.load(os.path.join(args.resume, "checkpoint-last.pth"), map_location='cpu', weights_only=False)
-        model_without_ddp.load_state_dict(checkpoint['model'])
+        missing, unexpected = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        if missing or unexpected:
+            print(f"Checkpoint loaded with missing keys: {missing} and unexpected keys: {unexpected}")
         model_params = list(model_without_ddp.parameters())
         ema_state_dict = checkpoint['model_ema']
         ema_params = [ema_state_dict[name].cuda() for name, _ in model_without_ddp.named_parameters()]

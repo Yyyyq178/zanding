@@ -310,8 +310,6 @@ class MAR(nn.Module):
                  diffusion_batch_mul=1,         #单卡最好设为1，之前为4
                  grad_checkpointing=False,
                  mse_weight=0.2,
-                 use_deg_head=False,
-                 deg_use_sigmoid=True,
                  use_lr_inject=False,
                  lr_inject_layers="all",
                  lr_inject_cond_source="encoder",
@@ -332,8 +330,6 @@ class MAR(nn.Module):
         self.token_embed_dim = vae_embed_dim * patch_size**2
         self.grad_checkpointing = grad_checkpointing
         self.mse_weight = mse_weight
-        self.use_deg_head = use_deg_head
-        self.deg_use_sigmoid = deg_use_sigmoid
         self.use_lr_inject = use_lr_inject
         self.lr_inject_cond_source = lr_inject_cond_source
         self.use_rope = use_rope
@@ -418,13 +414,6 @@ class MAR(nn.Module):
             grad_checkpointing=grad_checkpointing
         )
         self.diffusion_batch_mul = diffusion_batch_mul
-        if self.use_deg_head:
-            self.degradation_head = nn.Sequential(
-                norm_layer(decoder_embed_dim),
-                nn.Linear(decoder_embed_dim, decoder_embed_dim // 2),
-                nn.GELU(),
-                nn.Linear(decoder_embed_dim // 2, 1),
-            )
         if self.use_lr_inject:
             source_dim = self._infer_lr_inject_source_dim(encoder_embed_dim)
             self.lr_inject_cond_proj_encoder = self._build_cond_proj(
@@ -723,7 +712,7 @@ class MAR(nn.Module):
             freqs_cis_full = self.get_rope_freqs(shape_hr, shape_lr, x.device, head_dim)
             # 注意：这里不需要 repeat 到 batch 维度，apply_rotary_emb 会处理广播，
             # 或者为了保险起见，跟 Encoder 保持一致：
-            freqs_cis_full = freqs_cis_full.repeat(bsz, 1, 1) # 可选，视显存情况而定
+            freqs_cis_full = freqs_cis_full.repeat(bsz, 1, 1) 
         else:
             freqs_cis_full = None
             if not hasattr(self, "decoder_pos_embed_learned"):
@@ -756,8 +745,7 @@ class MAR(nn.Module):
         # 移除 Buffer (LR tokens)
         x = x[:, num_lr_tokens:]
 
-        # [修正] 必须为 DiffLoss 加回绝对位置编码！
-        # 这里需要调用你之前删掉的 get_2d_sincos_pos_embed_torch 函数
+        # 这里调用get_2d_sincos_pos_embed_torch 函数
         # 使用 self.seq_h 作为 base_size 保持一致性
         pos_embed = get_2d_sincos_pos_embed_torch(
             self.decoder_embed.out_features, shape_hr, shape_lr, x.device, base_size=self.seq_h
@@ -795,20 +783,10 @@ class MAR(nn.Module):
         return loss, loss_diff, loss_mse
 
     def forward(self, x_hr, x_lr, gate_multiplier=1.0):
-        # x_hr: HR Latents [B, 16, 16, 16]
-        # x_lr: LR Latents [B, 16, 32, 32]
-        # class embed
-        #class_embedding = self.class_emb(x_lr)
-
-        # 显式获取 Latent 的真实高宽
-        # 这就是支持长方形输入的关键：不再假设 H=W
-        #_, _, h_hr, w_hr = x_hr.shape
-        #_, _, h_lr, w_lr = x_lr.shape
         shape_hr = (self.seq_h, self.seq_w)
         shape_lr = (self.seq_h, self.seq_w)
 
         # patchify and mask (drop) tokens
-        # 切片化
         lr_tokens = self.patchify(x_lr)
         hr_tokens = self.patchify(x_hr)
         # 获取当前 batch 的真实 token 数量
@@ -852,16 +830,11 @@ class MAR(nn.Module):
 
         # loss
         loss, loss_diff, loss_mse = self.forward_loss(z=z, pos_embed=pos_embed, target=gt_latents, mask=mask)
-        if self.use_deg_head:
-            d_tok_pred = self.degradation_head(z).squeeze(-1)
-            if self.deg_use_sigmoid:
-                d_tok_pred = torch.sigmoid(d_tok_pred)
-            assert d_tok_pred.shape[1] == gt_latents.shape[1], "D_tok_pred shape mismatch with token count."
-            return loss, loss_diff, loss_mse, d_tok_pred
         
         return loss, loss_diff, loss_mse
+        
     def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", x_lr=None,
-                      temperature=1.0, progress=False, target_seq_len=None, curriculum_decode=False,
+                      temperature=1.0, progress=False,
                       gate_multiplier=1.0):
         # 必须有 LR 输入
         if x_lr is None:
@@ -894,30 +867,8 @@ class MAR(nn.Module):
         # 初始化 Token：全为 0 (画布是黑的)
         tokens = torch.zeros(bsz, num_hr_tokens, self.token_embed_dim).cuda()
         # 生成顺序：决定先画哪儿，后画哪儿
-        #orders = self.sample_orders(bsz)
-        if curriculum_decode:
-            if not self.use_deg_head:
-                raise ValueError("curriculum_decode requires use_deg_head=True.")
-            with torch.no_grad():
-                x_full = self.forward_mae_encoder(
-                    tokens, mask, lr_tokens, shape_hr, shape_lr,
-                    cond_tokens=cond_tokens_encoder,
-                    cond_kv_cache=cond_kv_cache_encoder,
-                    gate_multiplier=gate_multiplier
-                )
-                z_full, _ = self.forward_mae_decoder(
-                    x_full, mask, shape_hr, shape_lr,
-                    cond_tokens=cond_tokens_decoder,
-                    cond_kv_cache=cond_kv_cache_decoder,
-                    gate_multiplier=gate_multiplier
-                )
-            d_tok_pred = self.degradation_head(z_full).squeeze(-1)
-            if self.deg_use_sigmoid:
-                d_tok_pred = torch.sigmoid(d_tok_pred)
-            assert d_tok_pred.shape[1] == num_hr_tokens, "D_tok_pred shape mismatch with token count."
-            orders = torch.argsort(d_tok_pred, dim=-1, descending=True)
-        else:
-            orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
+      
+        orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
 
         indices = list(range(num_iter))
         if progress:

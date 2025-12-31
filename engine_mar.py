@@ -7,9 +7,7 @@ import torch
 import util.misc as misc
 import util.lr_sched as lr_sched
 import torch.nn.functional as F
-from models.vae import DiagonalGaussianDistribution
 from dataset.codeformer import CodeFormerDegradation
-from util.deg_utils import build_degradation_map, pool_degradation_to_tokens
 import pyiqa
 import shutil
 import cv2
@@ -75,8 +73,6 @@ def train_one_epoch(model, vae,
     degradation_model = CodeFormerDegradation()
 
     gate_multiplier = 1.0
-    num_iter = args.decode_steps if (args.curriculum_decode and args.decode_steps is not None) else args.num_iter
-    global_step_offset = epoch * num_steps_per_epoch
 
     for data_iter_step, (samples_hr, samples_lr, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
@@ -102,34 +98,11 @@ def train_one_epoch(model, vae,
             posterior_lr = vae.encode(samples_lr)
             x_lr = posterior_lr.sample().mul_(0.2325)
 
-        d_tok_gt = None
-        if args.use_deg_head:
-            d_pix_gt = build_degradation_map(samples_hr, samples_lr, args.deg_w_pix, args.deg_w_grad)
-            d_tok_gt = pool_degradation_to_tokens(d_pix_gt, model)
-
         with torch.amp.autocast('cuda'):
             model_out = model(
                 x_hr, x_lr, gate_multiplier=gate_multiplier,
-                curriculum_decode=args.curriculum_decode,
-                num_iter=num_iter,
-                d_tok_gt=d_tok_gt,
-                global_step=global_step_offset + data_iter_step,
-                curriculum_pred_order_warmup_steps=args.curriculum_pred_order_warmup_steps,
-                curriculum_pred_order_prob_max=args.curriculum_pred_order_prob_max,
             )
-
-            if args.use_deg_head:
-                loss, loss_diff, loss_mse, d_tok_pred = model_out
-            else:
-                loss, loss_diff, loss_mse = model_out
-                d_tok_pred = None
-
-            if args.use_deg_head:
-                assert d_tok_pred is not None
-                d_tok_gt = d_tok_gt.to(d_tok_pred.device)
-                assert d_tok_pred.shape == d_tok_gt.shape
-                loss_deg = F.l1_loss(d_tok_pred, d_tok_gt)
-                loss = loss + args.lambda_deg * loss_deg
+            loss, loss_diff, loss_mse = model_out
 
             loss_value = loss.item()
 
@@ -152,12 +125,6 @@ def train_one_epoch(model, vae,
             metric_logger.update(lr_inject_gate_mean=gate_mean)
             metric_logger.update(lr_inject_gate_multiplier=gate_multiplier)
 
-        if args.use_deg_head:
-            loss_deg_value = loss_deg.item()
-            d_mean = d_tok_pred.mean().item()
-            metric_logger.update(loss_deg=loss_deg_value)
-            metric_logger.update(d_tok_mean=d_mean)
-
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
 
@@ -171,9 +138,6 @@ def train_one_epoch(model, vae,
             if args.use_lr_inject:
                 log_writer.add_scalar('train_lr_inject_gate_mean', misc.all_reduce_mean(gate_mean), epoch_1000x)
                 log_writer.add_scalar('train_lr_inject_gate_multiplier', misc.all_reduce_mean(gate_multiplier), epoch_1000x)
-            if args.use_deg_head:
-                log_writer.add_scalar('train_loss_deg', misc.all_reduce_mean(loss_deg_value), epoch_1000x)
-                log_writer.add_scalar('train_d_tok_mean', misc.all_reduce_mean(d_mean), epoch_1000x)
 
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -286,25 +250,17 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
             posterior_lr = vae.encode(imgs_lr)
             x_lr = posterior_lr.sample().mul_(0.2325) 
 
-        # 计算目标 Token 数量 (HR Latent 的长度)
-        h_hr, w_hr = imgs_hr.shape[-2:]
-        feat_h, feat_w = h_hr // 16, w_hr // 16 # 假设 stride=16
-        target_seq_len = feat_h * feat_w
-
         # 生成 (Inference)
         with torch.no_grad():
             with torch.amp.autocast('cuda'):
                 # 调用 sample_tokens，传入 x_lr
-                num_iter = args.decode_steps if (args.curriculum_decode and args.decode_steps is not None) else args.num_iter
                 sampled_tokens = model_without_ddp.sample_tokens(
                     bsz=imgs_lr.shape[0], 
-                    num_iter=num_iter, 
+                    num_iter=args.num_iter, 
                     cfg=cfg,
                     cfg_schedule=args.cfg_schedule, 
                     x_lr=x_lr,
                     temperature=args.temperature,
-                    target_seq_len=target_seq_len,
-                    curriculum_decode=args.curriculum_decode,
                 )
             
                 # 解码生成的 Token 变回图片
