@@ -916,7 +916,8 @@ class MAR(nn.Module):
         # init and sample generation orders
         mask = torch.ones(bsz, num_hr_tokens).cuda()
         tokens = torch.zeros(bsz, num_hr_tokens, self.token_embed_dim).cuda()
-      
+        # 初始化实际步数 (默认为设定的固定步数)
+        actual_steps = num_iter
         if not self.use_dynamic_maskgit:
             # 旧逻辑：固定步数的 MaskGIT
             orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
@@ -1036,7 +1037,8 @@ class MAR(nn.Module):
                         f"mean ũ={u_std_flat.mean().item():.3f}"
                     )
                 round_idx += 1
-        
+        # 循环结束后，记录实际跑了多少轮
+            actual_steps = round_idx
         # unpatchify
         tokens = self.unpatchify(tokens, shape=shape_hr)
         return tokens

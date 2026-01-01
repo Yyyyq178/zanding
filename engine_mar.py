@@ -263,6 +263,8 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
 
     total_inference_time = 0.0
     total_images_processed = 0
+    total_steps_accum = 0
+
     for i, (imgs_hr, imgs_lr, filenames) in enumerate(data_loader):
 
         imgs_hr = imgs_hr.cuda(args.device, non_blocking=True)
@@ -291,7 +293,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         with torch.no_grad():
             with torch.amp.autocast('cuda'):
                 # 调用 sample_tokens，传入 x_lr
-                sampled_tokens = model_without_ddp.sample_tokens(
+                sampled_tokens, real_steps = model_without_ddp.sample_tokens(
                     bsz=imgs_lr.shape[0], 
                     num_iter=args.num_iter, 
                     x_lr=x_lr,
@@ -306,6 +308,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         total_inference_time += batch_time
         curr_bsz = imgs_lr.shape[0]
         total_images_processed += curr_bsz
+        total_steps_accum += real_steps * curr_bsz
 
         if misc.get_rank() == 0:
             print(f"[{i}/{len(data_loader)}] "
@@ -342,9 +345,10 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
 
         # --- 所有循环结束后打印总结 ---
         if misc.get_rank() == 0 and total_images_processed > 0:
+            avg_steps = total_steps_accum / total_images_processed
             print("\n" + "="*50)
             print(f"推理性能总结:")
-            print(f"  - 推理总步数: {args.num_iter}")
+            print(f"  - 平均推理步数: {avg_steps:.2f}")
             print(f"  - 处理图片总数: {total_images_processed}")
             print(f"  - 推理总耗时: {total_inference_time:.2f}s")
             print(f"  - 全局平均耗时 (每张): {total_inference_time/total_images_processed:.4f}s")

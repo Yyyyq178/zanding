@@ -2,7 +2,7 @@ import os
 
 # ================= 配置区域 =================
 # 请在这里填入你需要修改图片名字的文件夹路径
-target_folder = '/root/autodl-tmp/zanding/Evaluate_Resume_Baseline/ariter64-diffstepsddim100-temp1.0-image_num70000_ema_evaluate/sr_images'
+target_folder = '/root/autodl-tmp/zanding/Evaluate_Resume_0.0_0.02_40:10_1/ariter64-diffstepsddim100-temp1.0-image_num70000_ema_evaluate/sr_images'
 # ===========================================
 
 def remove_suffix():
