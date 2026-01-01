@@ -335,39 +335,11 @@ class GaussianDiffusion:
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape
         
-        # 1. 获取系数
-        # coeff1 = 1 / sqrt(alpha_bar_t)
         coeff1 = _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape)
-        # coeff2 = sqrt(1/alpha_bar_t - 1)
         coeff2 = _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
         
-        # 2. 计算预测的 x_start (Latent)
         pred_xstart = coeff1 * x_t - coeff2 * eps
-        
-        # # 🟢【修改】修正索引方式
-        # # 仅在主进程且偶尔打印
-        # current_t = t[0].item()
-        # if (current_t % 20 == 0 or pred_xstart.abs().max() > 100) and (t[0] == t[-1]): # 简单确保是一个时间步
-        #     # 🟢 新代码 (正确)
-        #     # 无论 coeff1 是几维的，先拉直，再取第一个数
-        #     # 这样 [N, 1] 或者 [N, C, H, W] 都能通用
-        #     alpha_val = coeff1.flatten()[0].item()
-            
-        #     # 避免除以0
-        #     if alpha_val > 0:
-        #         alpha_bar = 1 / (alpha_val ** 2)
-        #     else:
-        #         alpha_bar = 0.0
 
-        #     print(f"\n🔍 [Step {current_t}] 诊断报告:")
-        #     print(f"   - alpha_bar_t (信号强度): {alpha_bar:.6f}")
-        #     print(f"   - 1/sqrt(alpha) (放大倍数): {alpha_val:.2f}")
-        #     print(f"   - eps (预测噪声) Range: [{eps.min():.2f}, {eps.max():.2f}]")
-        #     print(f"   - x_t (当前带噪) Range: [{x_t.min():.2f}, {x_t.max():.2f}]")
-        #     print(f"   - x_0 (预测原图) Range: [{pred_xstart.min():.2f}, {pred_xstart.max():.2f}]")
-            
-        #     if pred_xstart.abs().max() > 1000:
-        #         print("   ⚠️ 警告：x_0 数值已严重爆炸！")
 
         return pred_xstart
     ######
@@ -464,6 +436,8 @@ class GaussianDiffusion:
         device=None,
         progress=False,
         temperature=1.0,
+        confidence_accumulator=None,
+        return_confidence: bool = False,        
     ):
         """
         Generate samples from the model.
@@ -482,6 +456,8 @@ class GaussianDiffusion:
                        If not specified, use a model parameter's device.
         :param progress: if True, show a tqdm progress bar.
         :param temperature: temperature scaling during Diff Loss sampling.
+        :param confidence_accumulator: optional accumulator to collect log-variance stats.
+        :param return_confidence: when True, also return confidence map aggregated over window.
         :return: a non-differentiable batch of samples.
         """
         final = None
@@ -496,8 +472,16 @@ class GaussianDiffusion:
             device=device,
             progress=progress,
             temperature=temperature,
+            confidence_accumulator=confidence_accumulator,
         ):
             final = sample
+        if confidence_accumulator is not None:
+            u_map = confidence_accumulator.finalize()
+        else:
+            u_map = None
+        if return_confidence:
+            return final["sample"], u_map
+        
         return final["sample"]
 
     def p_sample_loop_progressive(
@@ -512,6 +496,7 @@ class GaussianDiffusion:
         device=None,
         progress=False,
         temperature=1.0,
+        confidence_accumulator=None,
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -546,6 +531,8 @@ class GaussianDiffusion:
                     model_kwargs=model_kwargs,
                     temperature=temperature,
                 )
+                if confidence_accumulator is not None and "log_variance" in out:
+                    confidence_accumulator.maybe_add(i, out["log_variance"])
                 yield out
                 img = out["sample"]
 

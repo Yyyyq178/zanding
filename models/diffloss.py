@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 import math
-
+from typing import Optional, Tuple
 from diffusion import create_diffusion
 
 
@@ -33,17 +33,36 @@ class DiffLoss(nn.Module):
             loss = (loss * mask).sum() / mask.sum()
         return loss.mean()
 
-    def sample(self, z, temperature=1.0):
+    def sample(
+        self,
+        z,
+        temperature=1.0,
+        confidence_accumulator=None,
+        return_confidence: bool = False,
+    ):
         # diffusion loss sampling without CFG (standard forward)
         noise = torch.randn(z.shape[0], self.in_channels).cuda()
         model_kwargs = dict(c=z)
         sample_fn = self.net.forward
 
-        sampled_token_latent = self.gen_diffusion.p_sample_loop(
-            sample_fn, noise.shape, noise, clip_denoised=False, model_kwargs=model_kwargs, progress=False,
-            temperature=temperature
+        result = self.gen_diffusion.p_sample_loop(
+            sample_fn,
+            noise.shape,
+            noise,
+            clip_denoised=False,
+            model_kwargs=model_kwargs,
+            progress=False,
+            temperature=temperature,
+            confidence_accumulator=confidence_accumulator,
+            return_confidence=return_confidence,
         )
-
+        if return_confidence:
+            sampled_token_latent, u_map = result
+        else:
+            sampled_token_latent = result
+            u_map = None
+        if return_confidence:
+            return sampled_token_latent, u_map
         return sampled_token_latent
 
 

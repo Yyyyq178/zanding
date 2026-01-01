@@ -57,6 +57,14 @@ def get_args_parser():
                         help='number of autoregressive iterations to generate an image')
     parser.add_argument('--num_images', default=70000, type=int,
                         help='number of images to generate')
+    parser.add_argument('--use_dynamic_maskgit', action='store_true',
+                        help='Use dynamic MaskGIT with variance confidence (inference only)')
+    parser.add_argument('--conf_threshold', type=float, default=0.0,
+                        help='Confidence threshold tau for accepting tokens')
+    parser.add_argument('--conf_pmin', type=float, default=0.01,
+                        help='Minimum fraction of tokens to force-accept each round')
+    parser.add_argument('--conf_window', type=str, default='40:10',
+                        help='Confidence window steps specification (e.g., \"40:10\" or comma-separated list)')
     #parser.add_argument('--label_drop_prob', default=0.1, type=float)
     parser.add_argument('--eval_freq', type=int, default=40, help='evaluation frequency')
     parser.add_argument('--save_last_freq', type=int, default=5, help='save last frequency')
@@ -371,6 +379,10 @@ def main(args):
         lr_inject_cond_source=args.lr_inject_cond_source,
         use_rope=args.use_rope,
         use_mse_loss=args.use_mse_loss,
+        use_dynamic_maskgit=args.use_dynamic_maskgit,
+        conf_threshold=args.conf_threshold,
+        conf_pmin=args.conf_pmin,
+        conf_window=args.conf_window,
     )
 
     print("Model = %s" % str(model))

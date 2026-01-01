@@ -10,9 +10,10 @@ from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
 
 from timm.models.vision_transformer import Block, Mlp, DropPath
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Iterable
 from models.diffloss import DiffLoss
 from util.misc import is_main_process
+from models.confidence import VarianceConfidenceAccumulator, standardize, load_confidence_stats
 
 # =========================================================================
 # RoPE 核心函数
@@ -49,10 +50,53 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     
     return xq_out.type_as(xq), xk_out.type_as(xk)
-# =========================================================================
-# 自定义支持 RoPE 的 Transformer Block
-# =========================================================================
 
+# Confidence helpers
+def _parse_conf_window(conf_window: Optional[str], num_timesteps: int) -> List[int]:
+    """
+    Parse confidence window specification to a list of timesteps.
+    Supports formats like "40:10" (start=40, step=10 descending) or comma-separated integers.
+    """
+    if conf_window is None or conf_window == "":
+        return []
+
+    if isinstance(conf_window, (list, tuple, set)):
+        items = list(conf_window)
+    else:
+        conf_window = str(conf_window)
+        if "," in conf_window:
+            items = conf_window.split(",")
+        elif ":" in conf_window:
+            parts = conf_window.split(":")
+            nums = [int(p) for p in parts if p != ""]
+            if len(nums) == 2:
+                start, step = nums
+                step = abs(step) if step != 0 else 1
+                items = list(range(start, -1, -step))
+            elif len(nums) == 3:
+                start, end, step = nums
+                step = abs(step) if step != 0 else 1
+                if start <= end:
+                    items = list(range(start, min(end, num_timesteps - 1) + 1, step))
+                else:
+                    items = list(range(start, max(end, 0) - 1, -step))
+            else:
+                items = nums
+        else:
+            items = [conf_window]
+
+    steps: List[int] = []
+    for item in items:
+        try:
+            step_int = int(item)
+        except ValueError:
+            continue
+        if 0 <= step_int < num_timesteps:
+            steps.append(step_int)
+
+    return sorted(list(set(steps)), reverse=False)
+
+# 自定义支持 RoPE 的 Transformer Block
 class RoPEAttention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
@@ -312,6 +356,10 @@ class MAR(nn.Module):
                  lr_inject_cond_source="encoder",
                  use_rope=False,
                  use_mse_loss=False,
+                 use_dynamic_maskgit: bool = False,
+                 conf_threshold: float = 0.0,
+                 conf_pmin: float = 0.01,
+                 conf_window: str = "40:10",
                  ):
         super().__init__()
 
@@ -331,6 +379,14 @@ class MAR(nn.Module):
         self.lr_inject_cond_source = lr_inject_cond_source
         self.use_rope = use_rope
         self.use_mse_loss = use_mse_loss
+        self.use_dynamic_maskgit = use_dynamic_maskgit
+        self.conf_threshold = conf_threshold
+        self.conf_pmin = conf_pmin
+        self.conf_window = conf_window
+        self.remask_mode = "mask_token"
+        self.conf_stats_path = None
+        self._conf_stats_cache = None
+        self._confidence_window_cache = None
         # --------------------------------------------------------------------------
         # MAR variant masking ratio, a left-half truncated Gaussian centered at 100% masking ratio with std 0.25
         self.mask_ratio_generator = stats.truncnorm((mask_ratio_min - 1.0) / 0.25, 0, loc=1.0, scale=0.25)
@@ -502,7 +558,27 @@ class MAR(nn.Module):
         if not gates:
             return 0.0
         return torch.stack(gates).mean().item()
+    
+    def _get_confidence_window(self) -> List[int]:
+        if hasattr(self, "_confidence_window_cache") and self._confidence_window_cache is not None:
+            return self._confidence_window_cache
+        num_steps = self.diffloss.gen_diffusion.num_timesteps
+        self._confidence_window_cache = _parse_conf_window(self.conf_window, num_steps)
+        return self._confidence_window_cache
 
+    def _get_confidence_stats(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._conf_stats_cache is None:
+            stats = load_confidence_stats(None)
+            if stats is None:
+                # Fallback to neutral stats to keep pipeline functional without file.
+                mu_u = torch.zeros(1, device=device)
+                sigma_u = torch.ones(1, device=device)
+            else:
+                mu_u, sigma_u = stats
+            self._conf_stats_cache = (mu_u.float(), sigma_u.float())
+        mu_u, sigma_u = self._conf_stats_cache
+        return mu_u.to(device), sigma_u.to(device)
+    
     def _init_weights(self, m):
         # 初始化全连接层和归一化层的bias和weight
         if isinstance(m, nn.Linear):
@@ -837,66 +913,127 @@ class MAR(nn.Module):
                 cond_tokens_decoder = cond_tokens_decoder + lr_pos_dec
 
         # init and sample generation orders
-        # 初始化掩码：全为 1 (代表全图被遮挡/未知)
         mask = torch.ones(bsz, num_hr_tokens).cuda()
-        # 初始化 Token：全为 0 (画布是黑的)
         tokens = torch.zeros(bsz, num_hr_tokens, self.token_embed_dim).cuda()
-        # 生成顺序：决定先画哪儿，后画哪儿
       
-        orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
+        if not self.use_dynamic_maskgit:
+            # 旧逻辑：固定步数的 MaskGIT
+            orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
+            indices = list(range(num_iter))
+            if progress:
+                indices = tqdm(indices)
+            prev_mask_len = None
+            # generate latents
+            for step in indices:
+                cur_tokens = tokens.clone()
+                # mae encoder
+                x = self.forward_mae_encoder(
+                    tokens, mask, lr_tokens, shape_hr, shape_lr,
+                    cond_tokens=cond_tokens_encoder,
+                    gate_multiplier=gate_multiplier
+                )
+                
+                # mae decoder
+                z, pos_embed = self.forward_mae_decoder(
+                    x, mask, shape_hr, shape_lr,
+                    cond_tokens=cond_tokens_decoder,
+                    gate_multiplier=gate_multiplier
+                )
+                # mask ratio for the next round, following MaskGIT and MAGE.
+                mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
+                mask_len = torch.Tensor([np.floor(num_hr_tokens * mask_ratio)]).cuda()
 
-        indices = list(range(num_iter))
-        if progress:
-            indices = tqdm(indices)
-        prev_mask_len = None
-        # generate latents
-        for step in indices:
-            cur_tokens = tokens.clone()
-            # mae encoder
-            x = self.forward_mae_encoder(
-                tokens, mask, lr_tokens, shape_hr, shape_lr,
-                cond_tokens=cond_tokens_encoder,
-                gate_multiplier=gate_multiplier
-            )
-            
-            # mae decoder
-            z, pos_embed = self.forward_mae_decoder(
-                x, mask, shape_hr, shape_lr,
-                cond_tokens=cond_tokens_decoder,
-                gate_multiplier=gate_multiplier
-            )
+                # masks out at least one for the next iteration
+                mask_len = torch.maximum(torch.Tensor([1]).cuda(),
+                                         torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len))
+                if prev_mask_len is not None:
+                    assert mask_len[0] <= prev_mask_len + 1e-6, "Mask length must be non-increasing."
+                prev_mask_len = mask_len[0]
+                # get masking for next iteration and locations to be predicted in this iteration
+                mask_next = mask_by_order(mask_len[0], orders, bsz, num_hr_tokens)
+                if step >= num_iter - 1:
+                    mask_to_pred = mask[:bsz].bool()
+                    mask_next = torch.zeros_like(mask)
+                else:
+                    mask_to_pred = torch.logical_xor(mask[:bsz].bool(), mask_next.bool())
+                mask = mask_next
 
-            # mask ratio for the next round, following MaskGIT and MAGE.
-            mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
-            #mask_len = torch.Tensor([np.floor(self.seq_len * mask_ratio)]).cuda()
-            mask_len = torch.Tensor([np.floor(num_hr_tokens * mask_ratio)]).cuda()
+                # sample token latents for this step
+                indices_to_pred = mask_to_pred.nonzero(as_tuple=True)
+                
+                z_sub = z[indices_to_pred]
+                pos_sub = pos_embed[indices_to_pred]
+                z_cond = z_sub + pos_sub
+                
+                sampled_token_latent = self.diffloss.sample(z_cond, temperature)
 
-            # masks out at least one for the next iteration
-            mask_len = torch.maximum(torch.Tensor([1]).cuda(),
-                                     torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len))
-            if prev_mask_len is not None:
-                assert mask_len[0] <= prev_mask_len + 1e-6, "Mask length must be non-increasing."
-            prev_mask_len = mask_len[0]
-            # get masking for next iteration and locations to be predicted in this iteration
-            mask_next = mask_by_order(mask_len[0], orders, bsz, num_hr_tokens)
-            if step >= num_iter - 1:
+                cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
+                tokens = cur_tokens.clone()
+        else:
+            # 新逻辑：动态 while-loop + 方差置信度
+            window_steps = self._get_confidence_window()
+            if not window_steps:
+                window_steps = list(range(self.diffloss.gen_diffusion.num_timesteps))
+            mu_u, sigma_u = self._get_confidence_stats(tokens.device)
+            round_idx = 0
+            while mask.sum().item() > 0:
+                cur_tokens = tokens.clone()
+                x = self.forward_mae_encoder(
+                    tokens, mask, lr_tokens, shape_hr, shape_lr,
+                    cond_tokens=cond_tokens_encoder,
+                    gate_multiplier=gate_multiplier
+                )
+                z, pos_embed = self.forward_mae_decoder(
+                    x, mask, shape_hr, shape_lr,
+                    cond_tokens=cond_tokens_decoder,
+                    gate_multiplier=gate_multiplier
+                )
+
                 mask_to_pred = mask[:bsz].bool()
-                mask_next = torch.zeros_like(mask)
-            else:
-                mask_to_pred = torch.logical_xor(mask[:bsz].bool(), mask_next.bool())
-            mask = mask_next
+                indices_to_pred = mask_to_pred.nonzero(as_tuple=True)
+                if indices_to_pred[0].numel() == 0:
+                    break
+                z_sub = z[indices_to_pred]
+                pos_sub = pos_embed[indices_to_pred]
+                z_cond = z_sub + pos_sub
 
-            # sample token latents for this step
-            indices_to_pred = mask_to_pred.nonzero(as_tuple=True)
-            
-            z_sub = z[indices_to_pred]
-            pos_sub = pos_embed[indices_to_pred]
-            z_cond = z_sub + pos_sub
-            
-            sampled_token_latent = self.diffloss.sample(z_cond, temperature)
+                conf_acc = VarianceConfidenceAccumulator(window_steps)
+                sampled_token_latent, u_map = self.diffloss.sample(
+                    z_cond, temperature, confidence_accumulator=conf_acc, return_confidence=True
+                )
+                if u_map is None or u_map.numel() == 0:
+                    u_map = torch.zeros(z_cond.shape[0], device=z_cond.device, dtype=z_cond.dtype)
+                u_std = standardize(u_map, mu_u, sigma_u)
+                u_std_flat = u_std.reshape(-1)
+                num_masked = u_std_flat.shape[0]
+                pass_mask_flat = u_std_flat < self.conf_threshold
+                safety_min = max(1, math.ceil(max(self.conf_pmin, 0.0) * num_masked))
+                if pass_mask_flat.sum().item() < safety_min:
+                    topk = torch.topk(u_std_flat, k=safety_min, largest=False)
+                    pass_mask_flat[topk.indices] = True
+                fail_mask_flat = ~pass_mask_flat
 
-            cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
-            tokens = cur_tokens.clone()
+                # update tokens and mask
+                pass_indices = (indices_to_pred[0][pass_mask_flat], indices_to_pred[1][pass_mask_flat])
+                fail_indices = (indices_to_pred[0][fail_mask_flat], indices_to_pred[1][fail_mask_flat])
+                cur_tokens[pass_indices] = sampled_token_latent[pass_mask_flat]
+                if fail_mask_flat.any():
+                    if self.remask_mode == "keep":
+                        cur_tokens[fail_indices] = sampled_token_latent[fail_mask_flat]
+                    else:
+                        cur_tokens[fail_indices] = 0
+                tokens = cur_tokens.clone()
+                mask[pass_indices] = 0
+
+                if is_main_process():
+                    accepted = pass_mask_flat.sum().item()
+                    remaining = mask.sum().item()
+                    print(
+                        f"[Dynamic-MaskGIT] Round {round_idx}: accepted {accepted}/{num_masked}, "
+                        f"remaining mask {remaining}, min ũ={u_std_flat.min().item():.3f}, "
+                        f"mean ũ={u_std_flat.mean().item():.3f}"
+                    )
+                round_idx += 1
         
         # unpatchify
         tokens = self.unpatchify(tokens, shape=shape_hr)
