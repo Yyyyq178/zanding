@@ -1,4 +1,4 @@
-export MASTER_PORT=29505
+export MASTER_PORT=29504
 
 torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --model mar_base \
@@ -10,15 +10,19 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --vae_stride 16 \
     --patch_size 1 \
     --batch_size 1 \
-    --eval_bsz 8 \
+    --eval_bsz 1 \
     --img_size 512 \
     --resume output_Resume \
     --evaluate \
     --paired_test \
-    --hr_data_path /root/autodl-tmp/zanding/CelebA-Test-300/HQ \
-    --lr_data_path /root/autodl-tmp/zanding/CelebA-Test-300/LQ \
+    --hr_data_path /root/autodl-tmp/zanding/CelebA-Test-400/HQ \
+    --lr_data_path /root/autodl-tmp/zanding/CelebA-Test-400/LQ \
     --use_lr_inject \
     --use_rope \
     --use_mse_loss \
-    --output_dir Evaluate_Resume_Baseline_8
+    --use_dynamic_maskgit \
+    --conf_threshold "0.0" \
+    --conf_pmin 0.02 \
+    --conf_window '40:10' \
+    --output_dir Evaluate_Resume_0.0_0.02_40:10_1
 

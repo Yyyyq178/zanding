@@ -568,7 +568,8 @@ class MAR(nn.Module):
 
     def _get_confidence_stats(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         if self._conf_stats_cache is None:
-            stats = load_confidence_stats(None)
+            stats_path = "pretrained_models/confidence_stats.npz"
+            stats = load_confidence_stats(stats_path)
             if stats is None:
                 # Fallback to neutral stats to keep pipeline functional without file.
                 mu_u = torch.zeros(1, device=device)
@@ -1007,7 +1008,8 @@ class MAR(nn.Module):
                 u_std_flat = u_std.reshape(-1)
                 num_masked = u_std_flat.shape[0]
                 pass_mask_flat = u_std_flat < self.conf_threshold
-                safety_min = max(1, math.ceil(max(self.conf_pmin, 0.0) * num_masked))
+                global_min_tokens = math.ceil(bsz * self.seq_len * self.conf_pmin)
+                safety_min = min(num_masked, max(1, global_min_tokens))
                 if pass_mask_flat.sum().item() < safety_min:
                     topk = torch.topk(u_std_flat, k=safety_min, largest=False)
                     pass_mask_flat[topk.indices] = True

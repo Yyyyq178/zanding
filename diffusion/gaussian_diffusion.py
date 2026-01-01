@@ -422,7 +422,11 @@ class GaussianDiffusion:
             out["mean"] = self.condition_mean(cond_fn, out, x, t, model_kwargs=model_kwargs)
         # scale the noise by temperature
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise * temperature
-        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+        return {
+            "sample": sample, 
+            "pred_xstart": out["pred_xstart"],
+            "log_variance": out["log_variance"] 
+        }
 
     def p_sample_loop(
         self,
@@ -583,7 +587,11 @@ class GaussianDiffusion:
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         )  # no noise when t == 0
         sample = mean_pred + nonzero_mask * sigma * noise
-        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+        return {
+            "sample": sample, 
+            "pred_xstart": out["pred_xstart"], 
+            "log_variance": out["log_variance"]
+        }
 
     def ddim_reverse_sample(
         self,
