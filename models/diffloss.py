@@ -44,8 +44,6 @@ class DiffLoss(nn.Module):
             temperature=temperature
         )
 
-        if torch.rand(1).item() < 0.05:
-            print(f"ℹ️ [DiffLoss Sample] 采样成功。Range: [{sampled_token_latent.min():.2f}, {sampled_token_latent.max():.2f}]")
         return sampled_token_latent
 
 

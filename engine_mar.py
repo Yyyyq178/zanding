@@ -29,14 +29,14 @@ class _MetricRegistry:
             'ssim': ('ssim', True),
             'lpips': ('lpips', True),
             'dists': ('dists', True),
-            'ms_ssim': ('ms_ssim', True),
+            # 'ms_ssim': ('ms_ssim', True),
             # no-reference metrics
             'musiq': ('musiq', False),
-            'brisque': ('brisque', False),
-            'maniqa': ('maniqa', False),
-            'clipiqa': ('clipiqa', False),
-            'niqe': ('niqe', False),
-            'piqe': ('piqe', False),
+            # 'brisque': ('brisque', False),
+            # 'maniqa': ('maniqa', False),
+            # 'clipiqa': ('clipiqa', False),
+            # 'niqe': ('niqe', False),
+            # 'piqe': ('piqe', False),
         }
         print("Initializing evaluation metrics on rank0 (cached across runs)...")
         self.fid_metric = pyiqa.create_metric('fid', device=self.device)
@@ -225,7 +225,11 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
 
     metrics_registry = _get_or_create_metrics(args.device)
     metric_names = [
-        'psnr', 'ssim', 'lpips', 'dists', 'ms_ssim', 'musiq', 'brisque', 'maniqa', 'clipiqa', 'niqe', 'piqe', 'fid'
+        'psnr', 'ssim', 'lpips', 'dists', 
+        #'ms_ssim', 
+        'musiq', 
+        #'brisque', 'maniqa', 'clipiqa', 'niqe', 'piqe', 
+        'fid'
     ]
     metric_logger = misc.MetricLogger(delimiter="  ")
     for name in metric_names:
@@ -257,14 +261,16 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
 
     print(f"Start evaluation on {len(data_loader)} batches...")
 
+    total_inference_time = 0.0
+    total_images_processed = 0
     for i, (imgs_hr, imgs_lr, filenames) in enumerate(data_loader):
 
         imgs_hr = imgs_hr.cuda(args.device, non_blocking=True)
         imgs_lr = imgs_lr.cuda(args.device, non_blocking=True)
 
-        if i >= 5: 
-            print("Finished 5 batches preview, stopping evaluation.")
-            break 
+        # if i >= 5: 
+        #     print("Finished 5 batches preview, stopping evaluation.")
+        #     break 
 
         if not paired_mode:
             if args.evaluate:
@@ -275,6 +281,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         if swinir_model is not None:
             imgs_lr = preprocess_with_swinir(imgs_lr, swinir_model, args.swinir_batch)
 
+        start_time = time.time()
         # 编码 LR (作为条件)
         with torch.no_grad():
             posterior_lr = vae.encode(imgs_lr)
@@ -293,6 +300,19 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
                 # 解码生成的 Token 变回图片
                 sampled_images = vae.decode(sampled_tokens / 0.2325)
 
+        end_time = time.time()
+        # --- 计算并打印单次耗时 ---
+        batch_time = end_time - start_time
+        total_inference_time += batch_time
+        curr_bsz = imgs_lr.shape[0]
+        total_images_processed += curr_bsz
+
+        if misc.get_rank() == 0:
+            print(f"[{i}/{len(data_loader)}] "
+                  f"文件名: {filenames[0] if len(filenames)>0 else 'N/A'} | "
+                  f"推理步数: {args.num_iter} | "
+                  f"Batch耗时: {batch_time:.3f}s | "
+                  f"单张平均: {batch_time/curr_bsz:.3f}s")
         # 数据预处理：将范围从 [-1, 1] 转换到 [0, 1]
         # 注意：pyiqa 期望输入是 [0, 1] 的 float32 Tensor
         sr_tensor = (sampled_images + 1) / 2
@@ -320,6 +340,15 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
             for metric_name, metric_value in batch_scores.items():
                 metric_logger.update(**{metric_name: metric_value.mean().item()})
 
+        # --- 所有循环结束后打印总结 ---
+        if misc.get_rank() == 0 and total_images_processed > 0:
+            print("\n" + "="*50)
+            print(f"推理性能总结:")
+            print(f"  - 推理总步数: {args.num_iter}")
+            print(f"  - 处理图片总数: {total_images_processed}")
+            print(f"  - 推理总耗时: {total_inference_time:.2f}s")
+            print(f"  - 全局平均耗时 (每张): {total_inference_time/total_images_processed:.4f}s")
+            print("="*50 + "\n")
         # 保存 SR/HR 图片用于后续 FID 计算
         save_sr_hr_images(sr_tensor, hr_tensor, filenames, sr_save_dir, hr_save_dir, i)
 
@@ -356,12 +385,12 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
             
         print(f"Metrics appended to: {txt_path}")
     
-    # 2. 如果配置了 Tensorboard，写入验证集指标
+    # 如果配置了 Tensorboard，写入验证集指标
     if log_writer is not None:
         # 注意：这里假设你在第二步中已经像 metric_logger.update(psnr=...) 那样添加了这些 key
         for name, meter in metric_logger.meters.items():
             log_writer.add_scalar(f'val/{name}', meter.global_avg, epoch)
-            
+
     results = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
     if prev_training_mode:
         model_without_ddp.train()

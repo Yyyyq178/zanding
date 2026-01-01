@@ -2,7 +2,7 @@ import os
 
 # ================= 配置区域 =================
 # 请在这里填入你需要修改图片名字的文件夹路径
-target_folder = '/root/autodl-tmp/zanding/CelebA-Test-3000/DiffBIR_SR'
+target_folder = '/root/autodl-tmp/zanding/Evaluate_Resume_Baseline/ariter64-diffstepsddim100-temp1.0-image_num70000_ema_evaluate/sr_images'
 # ===========================================
 
 def remove_suffix():
@@ -26,9 +26,9 @@ def remove_suffix():
         name, ext = os.path.splitext(filename)
         
         # 核心逻辑：如果文件名以 '_0' 结尾
-        if name.endswith('_0'):
+        if name.startswith('rank0_'):
             # 去掉最后2个字符（即去掉 '_0'）
-            new_name_stem = name[:-2]
+            new_name_stem = name[6:]
             
             # 组合新名字。例如 '6' + '.png' -> '6.png'
             new_filename = new_name_stem + ext
