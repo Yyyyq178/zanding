@@ -566,19 +566,38 @@ class MAR(nn.Module):
         self._confidence_window_cache = _parse_conf_window(self.conf_window, num_steps)
         return self._confidence_window_cache
 
-    def _get_confidence_stats(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _get_confidence_stats(self, device: torch.device):
+        """
+        Modified to support Trajectory Confidence (returns sigma_delta).
+        """
         if self._conf_stats_cache is None:
-            stats_path = "pretrained_models/70:40/confidence_stats.npz"
-            stats = load_confidence_stats(stats_path)
+            # 修改为你校准文件的实际路径
+            fname = "pretrained_models/40_10_traj/confidence_stats.npz"
+            stats = load_confidence_stats(fname)
+            
             if stats is None:
-                # Fallback to neutral stats to keep pipeline functional without file.
-                mu_u = torch.zeros(1, device=device)
-                sigma_u = torch.ones(1, device=device)
+                # Fallback
+                self._conf_stats_cache = None
             else:
-                mu_u, sigma_u = stats
-            self._conf_stats_cache = (mu_u.float(), sigma_u.float())
-        mu_u, sigma_u = self._conf_stats_cache
-        return mu_u.to(device), sigma_u.to(device)
+                # 检查返回值类型
+                if isinstance(stats, tuple):
+                    # 旧版 (mu, sigma)
+                    print("Loaded Variance Confidence Stats (Legacy).")
+                    self._conf_stats_cache = (stats[0].float(), stats[1].float())
+                else:
+                    # 新版 (sigma_delta)
+                    print("Loaded Trajectory Confidence Stats (Sigma Delta).")
+                    self._conf_stats_cache = stats.float() # [1, C, 1, 1]
+
+        stats = self._conf_stats_cache
+        if stats is None:
+            return None
+            
+        # Move to device
+        if isinstance(stats, tuple):
+            return stats[0].to(device), stats[1].to(device)
+        else:
+            return stats.to(device)
     
     def _init_weights(self, m):
         # 初始化全连接层和归一化层的bias和weight
@@ -899,6 +918,7 @@ class MAR(nn.Module):
         shape_hr = (self.seq_h, self.seq_w)
         num_hr_tokens = self.seq_len
         self._maybe_log_lr_inject_rope(num_hr_tokens, shape_hr)
+        
         # 先展平 LR tokens
         lr_tokens = self.patchify(x_lr)
         cond_tokens_encoder = None
@@ -914,45 +934,39 @@ class MAR(nn.Module):
                 cond_tokens_decoder = cond_tokens_decoder + lr_pos_dec
 
         # init and sample generation orders
-        mask = torch.ones(bsz, num_hr_tokens).cuda()
-        tokens = torch.zeros(bsz, num_hr_tokens, self.token_embed_dim).cuda()
-        # 初始化实际步数 (默认为设定的固定步数)
+        device = x_lr.device 
+        mask = torch.ones(bsz, num_hr_tokens, device=device)
+        tokens = torch.zeros(bsz, num_hr_tokens, self.token_embed_dim, device=device)
+        
+        # 初始化实际步数
         actual_steps = num_iter
         
         if not self.use_dynamic_maskgit:
-            # 旧逻辑：固定步数的 MaskGIT
+            # === 旧逻辑：固定步数的 MaskGIT (保持不变) ===
             orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
             indices = list(range(num_iter))
             if progress:
                 indices = tqdm(indices)
             prev_mask_len = None
-            # generate latents
             for step in indices:
                 cur_tokens = tokens.clone()
-                # mae encoder
                 x = self.forward_mae_encoder(
                     tokens, mask, lr_tokens, shape_hr, shape_lr,
                     cond_tokens=cond_tokens_encoder,
                     gate_multiplier=gate_multiplier
                 )
-                
-                # mae decoder
                 z, pos_embed = self.forward_mae_decoder(
                     x, mask, shape_hr, shape_lr,
                     cond_tokens=cond_tokens_decoder,
                     gate_multiplier=gate_multiplier
                 )
-                # mask ratio for the next round, following MaskGIT and MAGE.
                 mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
                 mask_len = torch.Tensor([np.floor(num_hr_tokens * mask_ratio)]).cuda()
-
-                # masks out at least one for the next iteration
                 mask_len = torch.maximum(torch.Tensor([1]).cuda(),
                                          torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len))
                 if prev_mask_len is not None:
-                    assert mask_len[0] <= prev_mask_len + 1e-6, "Mask length must be non-increasing."
+                    assert mask_len[0] <= prev_mask_len + 1e-6
                 prev_mask_len = mask_len[0]
-                # get masking for next iteration and locations to be predicted in this iteration
                 mask_next = mask_by_order(mask_len[0], orders, bsz, num_hr_tokens)
                 if step >= num_iter - 1:
                     mask_to_pred = mask[:bsz].bool()
@@ -961,33 +975,69 @@ class MAR(nn.Module):
                     mask_to_pred = torch.logical_xor(mask[:bsz].bool(), mask_next.bool())
                 mask = mask_next
 
-                # sample token latents for this step
                 indices_to_pred = mask_to_pred.nonzero(as_tuple=True)
-                
                 z_sub = z[indices_to_pred]
                 pos_sub = pos_embed[indices_to_pred]
                 z_cond = z_sub + pos_sub
-                
                 sampled_token_latent = self.diffloss.sample(z_cond, temperature)
-
                 cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
                 tokens = cur_tokens.clone()
         else:
             # =======================================================
-            # 优化版 Dynamic MaskGIT: Active Batch + 串行 Transformer + 并行 Diffusion
+            # 优化版 Dynamic MaskGIT: 支持 轨迹稳定性 (Trajectory Stability)
             # =======================================================
             window_steps = self._get_confidence_window()
             if not window_steps:
                 window_steps = list(range(self.diffloss.gen_diffusion.num_timesteps))
-            mu_u, sigma_u = self._get_confidence_stats(tokens.device)
             
+            # 加载统计量 (需要确保 _get_confidence_stats 已更新以支持 sigma_delta)
+            stats = self._get_confidence_stats(tokens.device)
+            
+            # 模式判断
+            is_trajectory_mode = False
+            mu_u, sigma_u = None, None
+            sigma_delta = None
+
+            if stats is not None:
+                if isinstance(stats, tuple):
+                    # 旧版: Variance Mode
+                    mu_u, sigma_u = stats
+                else:
+                    # 新版: Trajectory Mode (stats 即为 sigma_delta Tensor)
+                    sigma_delta = stats
+                    is_trajectory_mode = True
+            else:
+                # 默认回退到 Trajectory 模式 (使用全1 sigma)
+                is_trajectory_mode = True
+                sigma_delta = torch.ones(1, self.token_embed_dim, 1, 1, device=tokens.device)
+
+            if is_main_process():
+                mode_str = "Trajectory Stability (Energy)" if is_trajectory_mode else "Prediction Variance (Z-Score)"
+                print(f"[Dynamic-MaskGIT] Running in {mode_str} mode.")
+
             round_idx = 0
             unfinished_batch_mask = torch.ones(bsz, dtype=torch.bool, device=tokens.device)
 
-            # === [配置] 阈值调度参数 ===
-            start_threshold = self.conf_threshold - 1.0
-            end_threshold = self.conf_threshold + 1.5
+            # === [配置] 动态参数 ===
+            # 注意：Trajectory 模式下，能量值 >= 0。0 表示完全收敛。
+            # 如果是 Trajectory 模式，Threshold 应该是正数 (如 0.2)。
+            # 如果是 Variance 模式，Threshold 通常是负数 (如 -0.5)。
+            # 这里需要根据 conf_threshold 基础值进行相对调整。
+            
+            if is_trajectory_mode:
+                # 能量越小越好。
+                start_threshold = max(0.0, self.conf_threshold - 0.4)
+                end_threshold = self.conf_threshold + 0.2
+            else:
+                # 方差越小越好 (Z-Score)。
+                start_threshold = self.conf_threshold - 1.0
+                end_threshold = self.conf_threshold + 1.5
+
             ramp_steps = 6.0
+            stochastic_scale = 0.5 # 随机扰动系数
+
+            # 动态导入 TrajectoryAccumulator (防止顶层循环导入)
+            from models.confidence.variance_confidence import TrajectoryConfidenceAccumulator, VarianceConfidenceAccumulator
 
             while unfinished_batch_mask.any():
                 active_indices = torch.nonzero(unfinished_batch_mask).squeeze(1)
@@ -1004,7 +1054,7 @@ class MAR(nn.Module):
                 if torch.is_tensor(gate_multiplier) and gate_multiplier.shape[0] == bsz:
                     gate_mul_active = gate_multiplier[active_indices]
 
-                # Transformer Forward (串行处理变长)
+                # Transformer Forward (串行处理变长 Batch)
                 z_list = []
                 pos_embed_list = []
                 for i in range(curr_bsz_active):
@@ -1031,34 +1081,42 @@ class MAR(nn.Module):
                 pos_sub_active = pos_embed_active[indices_to_pred_active]
                 z_cond_active = z_sub_active + pos_sub_active
 
-                # === 采样与置信度 ===
-                conf_acc = VarianceConfidenceAccumulator(window_steps)
+                # === 采样与置信度计算 ===
+                if is_trajectory_mode:
+                    # 使用差分能量累积器 (传入标定好的 sigma_delta)
+                    conf_acc = TrajectoryConfidenceAccumulator(window_steps, sigma_delta=sigma_delta)
+                else:
+                    # 使用旧版方差累积器
+                    conf_acc = VarianceConfidenceAccumulator(window_steps)
+
                 sampled_token_latent, u_map = self.diffloss.sample(
                     z_cond_active, temperature, confidence_accumulator=conf_acc, return_confidence=True
                 )
                 
                 if u_map is None or u_map.numel() == 0:
-                    u_map = torch.zeros(z_cond_active.shape[0], device=z_cond_active.device, dtype=z_cond_active.dtype)
+                    u_map = torch.zeros(z_cond_active.shape[0], device=z_cond_active.device)
                 
-                # === 1. 恢复：使用真实的置信度标准化 ===
-                u_std = standardize(u_map, mu_u, sigma_u) # [N_masked]
+                # === 归一化/标准化 ===
+                if is_trajectory_mode:
+                    # u_map 已经是归一化的能量值 (Delta / Sigma)^2
+                    # 不需要再做 Z-Score，因为它本身就是绝对物理量
+                    u_std = u_map 
+                else:
+                    # 旧版需要标准化
+                    u_std = standardize(u_map, mu_u, sigma_u)
 
-                # =======================================================
-                # [新增] 方案一：Stochastic Ranking (随机扰动)
-                # =======================================================
-                # 引入受控的随机噪声，解决"尺子偏科"问题 (平滑性偏差)
-                # 这会让高频纹理(高方差)有机会因为加上了有利的噪声而被保留
-                stochastic_scale = 1.0 # 经验值：0.2~1.0 之间调整
+                # === Stochastic Ranking (随机扰动) ===
+                # 依然适用：给不确定性高(Energy大/Variance大)的Token一个随机变小的机会
                 noise = torch.randn_like(u_std)
                 u_std = u_std + noise * stochastic_scale
-                # =======================================================
-
+                if is_main_process() and round_idx == 0:
+                    print(f"DEBUG Score: Min={u_std.min():.3f}, Max={u_std.max():.3f}, Mean={u_std.mean():.3f}")
                 u_std_flat = u_std.reshape(-1)
                 num_masked = u_std_flat.shape[0]
                 
-                # === 2. 计算当前的动态阈值 ===
-                progress = min(round_idx / ramp_steps, 1.0)
-                current_threshold = start_threshold + (end_threshold - start_threshold) * progress
+                # === 动态阈值 ===
+                progress_ratio = min(round_idx / ramp_steps, 1.0)
+                current_threshold = start_threshold + (end_threshold - start_threshold) * progress_ratio
                 
                 pass_mask_flat = u_std_flat < current_threshold
                 

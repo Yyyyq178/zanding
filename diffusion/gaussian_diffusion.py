@@ -535,8 +535,12 @@ class GaussianDiffusion:
                     model_kwargs=model_kwargs,
                     temperature=temperature,
                 )
-                if confidence_accumulator is not None and "log_variance" in out:
-                    confidence_accumulator.maybe_add(i, out["log_variance"])
+                if confidence_accumulator is not None:
+                    confidence_accumulator.update(
+                        t=i, 
+                        log_variance=out.get("log_variance"), 
+                        x_start=out["pred_xstart"]
+                    )
                 yield out
                 img = out["sample"]
 
