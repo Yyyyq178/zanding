@@ -22,12 +22,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --conf_threshold 1.0 \
     --conf_pmin 0.05 \
     --use_mse_loss \
-<<<<<<< HEAD
-    --conf_window '70:40' \
-    --output_dir Evaluate_Resume_-0.5_0.05_70:40_16_-1.5-1.0_1.0
-=======
     --conf_window '40:10' \
     --output_dir Evaluate_Resume_X0_1.0_0.05_40:10_16_0.6-1.2_0.5
->>>>>>> X_0
     
 
