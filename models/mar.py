@@ -1026,8 +1026,8 @@ class MAR(nn.Module):
             
             if is_trajectory_mode:
                 # 能量越小越好。
-                start_threshold = max(0.0, self.conf_threshold - 0.3)
-                end_threshold = self.conf_threshold + 0.3
+                start_threshold = max(0.0, self.conf_threshold - 0.4)
+                end_threshold = self.conf_threshold + 0.2
             else:
                 # 方差越小越好 (Z-Score)。
                 start_threshold = self.conf_threshold - 1.0
