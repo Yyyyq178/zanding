@@ -1,5 +1,4 @@
 export MASTER_PORT=29504
-
 torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --model mar_base \
     --diffloss_d 6 \
@@ -20,10 +19,10 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --use_lr_inject \
     --use_rope \
     --use_dynamic_maskgit \
-    --conf_threshold "-0.5" \
+    --conf_threshold 1.0 \
     --conf_pmin 0.05 \
     --use_mse_loss \
     --conf_window '40:10' \
-    --output_dir Evaluate_Resume_-0.5_0.05_40:10_16_-1.5-1.0_0.5
+    --output_dir Evaluate_Resume_X0_1.0_0.05_40:10_16_0.7-1.3_0.5
     
 

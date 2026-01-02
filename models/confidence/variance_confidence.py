@@ -1,10 +1,98 @@
 import json
 from pathlib import Path
-from typing import Optional, Sequence, Set, Tuple
+from typing import Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import torch
 
+class TrajectoryConfidenceAccumulator:
+    """
+    MD方案实现：x0 轨迹差分能量累积器 (Trajectory Stability)
+    兼容 2D (Tokens: [N, C]) 和 4D (Images: [B, C, H, W]) 输入。
+    """
+    def __init__(self, window_steps: Sequence[int], sigma_delta: Optional[torch.Tensor] = None, eps: float = 1e-6):
+        self.window_steps: Set[int] = set(int(s) for s in window_steps)
+        self.sigma_delta = sigma_delta # 初始传入可能是 [1, C, 1, 1]
+        self.eps = eps
+        self.reset()
+
+    def reset(self) -> None:
+        self.u_accum = None
+        self.x0_prev = None
+        self.cnt = 0
+
+    def update(self, t: int, x_start: torch.Tensor, **kwargs) -> None:
+        """
+        Args:
+            t: 当前 timestep
+            x_start: 当前预测的 x0。可能是 [N, C] 或 [B, C, H, W]
+        """
+        if t not in self.window_steps:
+            return
+
+        # 自动探测维度
+        ndim = x_start.ndim
+        
+        # === 初始化 ===
+        if self.u_accum is None:
+            if ndim == 2:
+                # Token模式: [N, C] -> 输出分数 [N]
+                N, C = x_start.shape
+                self.u_accum = torch.zeros(N, device=x_start.device, dtype=x_start.dtype)
+            elif ndim == 4:
+                # 图片模式: [B, C, H, W] -> 输出分数 [B, H, W]
+                B, C, H, W = x_start.shape
+                self.u_accum = torch.zeros(B, H, W, device=x_start.device, dtype=x_start.dtype)
+            else:
+                raise ValueError(f"Unsupported x_start shape: {x_start.shape}")
+            
+            self.x0_prev = x_start.detach().clone()
+            return
+
+        # === 累积计算 ===
+        if self.x0_prev is not None:
+            # 1. 计算差分
+            delta = x_start - self.x0_prev
+            
+            # 2. 归一化 (Sigma)
+            if self.sigma_delta is not None:
+                # 确保设备一致
+                if self.sigma_delta.device != delta.device:
+                    self.sigma_delta = self.sigma_delta.to(delta.device)
+                
+                # 动态调整 Sigma 形状以匹配输入
+                # 先把 sigma 展平成向量 [C]
+                sigma_flat = self.sigma_delta.flatten()
+                
+                if ndim == 2:
+                    # Input: [N, C] -> Sigma: [1, C]
+                    denom = sigma_flat.view(1, -1)
+                elif ndim == 4:
+                    # Input: [B, C, H, W] -> Sigma: [1, C, 1, 1]
+                    denom = sigma_flat.view(1, -1, 1, 1)
+                
+                delta = delta / (denom + self.eps)
+            
+            # 3. 计算能量 (平方和)
+            # 无论是 [N, C] 还是 [B, C, H, W]，Channel 都在 dim=1
+            u_step = (delta ** 2).mean(dim=1)
+            
+            # 4. 累积
+            self.u_accum += u_step
+            self.cnt += 1
+            self.x0_prev = x_start.detach().clone()
+
+    def finalize(self) -> torch.Tensor:
+        """
+        返回平均能量 u_i
+        """
+        if self.u_accum is None or self.cnt == 0:
+            # 防止空数据返回，返回一个标量0即可，外部通常会处理形状
+            return torch.zeros(1)
+        
+        # 平均能量
+        return self.u_accum / max(self.cnt, 1)
+    
 
 class VarianceConfidenceAccumulator:
     """
@@ -57,7 +145,15 @@ class VarianceConfidenceAccumulator:
         self.cnt += 1
         if self.collect_conf_stats:
             self._per_step.append(mean_logvar.detach().cpu())
-
+    def update(self, t: int, log_variance: Optional[torch.Tensor] = None, **kwargs) -> None:
+        if log_variance is None: return
+        if t not in self.window_steps: return
+        
+        mean_logvar = log_variance.mean(dim=1)
+        if self.u_accum is None:
+            self.reset(shape_like=log_variance)
+        self.u_accum = self.u_accum + mean_logvar
+        self.cnt += 1
     def finalize(self) -> torch.Tensor:
         """
         Finalize aggregation and return the averaged u_map.
@@ -92,36 +188,31 @@ def standardize(u_map: torch.Tensor, mu_u: torch.Tensor, sigma_u: torch.Tensor, 
     return (u_map - mu_u) / (sigma_u + eps)
 
 
-def load_confidence_stats(path: Optional[str]) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+def load_confidence_stats(path: Optional[str]) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None]:
     """
-    Load (mu_u, sigma_u) from a file. Supports npz, json, or yaml (via pyyaml if installed).
-
-    Returns tensors or None if path is not provided.
+    加载统计数据。
+    如果是旧版 .npz，返回 (mu, sigma)。
+    如果是新版 (trajectory)，返回 sigma_delta。
     """
     if path is None or path == "":
         return None
     path_obj = Path(path)
     if not path_obj.exists():
-        raise FileNotFoundError(f"Confidence stats file not found: {path}")
-    suffix = path_obj.suffix.lower()
-    if suffix == ".npz":
-        data = np.load(path_obj)
+        print(f"Warning: Stats file not found {path}")
+        return None
+        
+    data = np.load(path_obj)
+    
+    # 检测是哪种统计文件
+    if "sigma_delta" in data:
+        # 新方案：只返回 sigma_delta [C]
+        sigma_delta = torch.from_numpy(data["sigma_delta"])
+        # 调整形状为 [1, C, 1, 1] 以便广播
+        return sigma_delta.view(1, -1, 1, 1)
+    elif "mu_u" in data:
+        # 旧方案
         mu_u = torch.from_numpy(data["mu_u"])
         sigma_u = torch.from_numpy(data["sigma_u"])
-    elif suffix in {".json"}:
-        with open(path_obj, "r") as f:
-            data = json.load(f)
-        mu_u = torch.tensor(data["mu_u"])
-        sigma_u = torch.tensor(data["sigma_u"])
-    elif suffix in {".yml", ".yaml"}:
-        try:
-            import yaml  # type: ignore
-        except Exception as exc:
-            raise ImportError("pyyaml is required to load YAML confidence stats") from exc
-        with open(path_obj, "r") as f:
-            data = yaml.safe_load(f)
-        mu_u = torch.tensor(data["mu_u"])
-        sigma_u = torch.tensor(data["sigma_u"])
+        return mu_u, sigma_u
     else:
-        raise ValueError(f"Unsupported confidence stats format: {suffix}")
-    return mu_u, sigma_u
+        return None
