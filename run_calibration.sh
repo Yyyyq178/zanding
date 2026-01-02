@@ -19,13 +19,11 @@ python calibrate_stats.py \
     --resume output_Resume/checkpoint-last.pth \
     --hr_data_path /root/autodl-tmp/zanding/CelebA-Test-400/HQ \
     --lr_data_path /root/autodl-tmp/zanding/CelebA-Test-400/LQ \
-    --output_dir pretrained_models \
+    --output_dir pretrained_models/70:40 \
     --calib_batches 50 \
     --batch_size 8 \
     --use_lr_inject \
     --use_rope \
     --use_mse_loss \
-    --conf_window "40:10" \
+    --conf_window "70:40" \
     --num_sampling_steps "ddim100"
-
-echo "Calibration finished. Stats saved to output_Resume/confidence_stats.npz"

@@ -568,7 +568,7 @@ class MAR(nn.Module):
 
     def _get_confidence_stats(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         if self._conf_stats_cache is None:
-            stats_path = "pretrained_models/confidence_stats.npz"
+            stats_path = "pretrained_models/70:40/confidence_stats.npz"
             stats = load_confidence_stats(stats_path)
             if stats is None:
                 # Fallback to neutral stats to keep pipeline functional without file.
@@ -1048,7 +1048,7 @@ class MAR(nn.Module):
                 # =======================================================
                 # 引入受控的随机噪声，解决"尺子偏科"问题 (平滑性偏差)
                 # 这会让高频纹理(高方差)有机会因为加上了有利的噪声而被保留
-                stochastic_scale = 0.5 # 经验值：0.2~1.0 之间调整
+                stochastic_scale = 1.0 # 经验值：0.2~1.0 之间调整
                 noise = torch.randn_like(u_std)
                 u_std = u_std + noise * stochastic_scale
                 # =======================================================
