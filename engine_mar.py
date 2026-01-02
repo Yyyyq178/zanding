@@ -313,7 +313,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         if misc.get_rank() == 0:
             print(f"[{i}/{len(data_loader)}] "
                   f"文件名: {filenames[0] if len(filenames)>0 else 'N/A'} | "
-                  f"推理步数: {args.num_iter} | "
+                  f"推理步数: {real_steps} | "
                   f"Batch耗时: {batch_time:.3f}s | "
                   f"单张平均: {batch_time/curr_bsz:.3f}s")
         # 数据预处理：将范围从 [-1, 1] 转换到 [0, 1]

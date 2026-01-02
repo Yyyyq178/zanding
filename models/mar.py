@@ -883,7 +883,7 @@ class MAR(nn.Module):
             gate_multiplier=gate_multiplier
         )
 
-        # loss
+        # lossW
         loss, loss_diff, loss_mse = self.forward_loss(z=z, pos_embed=pos_embed, target=gt_latents, mask=mask)
         
         return loss, loss_diff, loss_mse
@@ -918,6 +918,7 @@ class MAR(nn.Module):
         tokens = torch.zeros(bsz, num_hr_tokens, self.token_embed_dim).cuda()
         # 初始化实际步数 (默认为设定的固定步数)
         actual_steps = num_iter
+        
         if not self.use_dynamic_maskgit:
             # 旧逻辑：固定步数的 MaskGIT
             orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
@@ -972,7 +973,7 @@ class MAR(nn.Module):
                 cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
                 tokens = cur_tokens.clone()
         else:
-# =======================================================
+            # =======================================================
             # 优化版 Dynamic MaskGIT: Active Batch + 串行 Transformer + 并行 Diffusion
             # =======================================================
             window_steps = self._get_confidence_window()
@@ -981,73 +982,47 @@ class MAR(nn.Module):
             mu_u, sigma_u = self._get_confidence_stats(tokens.device)
             
             round_idx = 0
-            # 追踪哪些样本还需要继续生成 (True = 未完成)
             unfinished_batch_mask = torch.ones(bsz, dtype=torch.bool, device=tokens.device)
 
-            # 只要还有样本没画完，就继续循环
+            # === [配置] 阈值调度参数 ===
+            start_threshold = self.conf_threshold - 1.0
+            end_threshold = self.conf_threshold + 1.5
+            ramp_steps = 6.0
+
             while unfinished_batch_mask.any():
-                # 1. === 筛选活跃样本 (Active Batch) ===
-                # active_indices: 当前未完成样本的全局索引
                 active_indices = torch.nonzero(unfinished_batch_mask).squeeze(1)
                 curr_bsz_active = active_indices.shape[0]
 
-                # 提取活跃样本的数据 (Slicing)
-                tokens_active = tokens[active_indices]      # [K, L, D]
-                mask_active = mask[active_indices]          # [K, L]
+                tokens_active = tokens[active_indices]
+                mask_active = mask[active_indices]
                 lr_tokens_active = lr_tokens[active_indices]
                 
-                # 处理条件输入 (Conditional Tokens)
                 cond_enc_active = cond_tokens_encoder[active_indices] if cond_tokens_encoder is not None else None
                 cond_dec_active = cond_tokens_decoder[active_indices] if cond_tokens_decoder is not None else None
                 
-                # 处理 gate_multiplier
                 gate_mul_active = gate_multiplier
                 if torch.is_tensor(gate_multiplier) and gate_multiplier.shape[0] == bsz:
                     gate_mul_active = gate_multiplier[active_indices]
 
-                # 2. === 串行执行 Transformer (解决变长问题) ===
-                # 由于每个样本的 mask ratio 不同，Encoder 内部的 reshape 无法对齐，必须逐个执行
+                # Transformer Forward (串行处理变长)
                 z_list = []
                 pos_embed_list = []
-                
                 for i in range(curr_bsz_active):
-                    # 取出单个样本 (保持 dim=0 为 1)
-                    t_i = tokens_active[i:i+1]
-                    m_i = mask_active[i:i+1]
-                    l_i = lr_tokens_active[i:i+1]
+                    t_i = tokens_active[i:i+1]; m_i = mask_active[i:i+1]; l_i = lr_tokens_active[i:i+1]
                     c_enc_i = cond_enc_active[i:i+1] if cond_enc_active is not None else None
                     c_dec_i = cond_dec_active[i:i+1] if cond_dec_active is not None else None
-                    
-                    # 兼容 Tensor 类型的 gate_multiplier
-                    if torch.is_tensor(gate_mul_active):
-                        g_mul_i = gate_mul_active[i:i+1]
-                    else:
-                        g_mul_i = gate_mul_active
+                    g_mul_i = gate_mul_active[i:i+1] if torch.is_tensor(gate_mul_active) else gate_mul_active
 
-                    # 运行 Encoder (输出是变长的)
-                    x_i = self.forward_mae_encoder(
-                        t_i, m_i, l_i, shape_hr, shape_lr,
-                        cond_tokens=c_enc_i, gate_multiplier=g_mul_i
-                    )
-                    # 运行 Decoder (Decoder 会自动把 Token 填回定长序列 [1, L, D])
-                    z_i, pos_i = self.forward_mae_decoder(
-                        x_i, m_i, shape_hr, shape_lr,
-                        cond_tokens=c_dec_i, gate_multiplier=g_mul_i
-                    )
-                    z_list.append(z_i)
-                    pos_embed_list.append(pos_i)
+                    x_i = self.forward_mae_encoder(t_i, m_i, l_i, shape_hr, shape_lr, cond_tokens=c_enc_i, gate_multiplier=g_mul_i)
+                    z_i, pos_i = self.forward_mae_decoder(x_i, m_i, shape_hr, shape_lr, cond_tokens=c_dec_i, gate_multiplier=g_mul_i)
+                    z_list.append(z_i); pos_embed_list.append(pos_i)
                 
-                # 3. === 重新堆叠为 Batch (Parallel Preparation) ===
-                # 此时 z_active 已经是规整的 [K, L, D] 形状了
                 z_active = torch.cat(z_list, dim=0)
                 pos_embed_active = torch.cat(pos_embed_list, dim=0)
 
-                # 4. === 并行执行 Diffusion (计算最重部分) ===
-                # 提取所有活跃样本中需要预测的位置，拼成一个巨大的 Batch
                 mask_to_pred_active = mask_active.bool()
                 indices_to_pred_active = mask_to_pred_active.nonzero(as_tuple=True)
                 
-                # 防御性检查：理论上 unfinished_mask 保证了这里不会为空
                 if indices_to_pred_active[0].numel() == 0:
                     unfinished_batch_mask[active_indices] = False
                     continue
@@ -1056,7 +1031,7 @@ class MAR(nn.Module):
                 pos_sub_active = pos_embed_active[indices_to_pred_active]
                 z_cond_active = z_sub_active + pos_sub_active
 
-                # 一次性并行采样所有 Token
+                # === 采样与置信度 ===
                 conf_acc = VarianceConfidenceAccumulator(window_steps)
                 sampled_token_latent, u_map = self.diffloss.sample(
                     z_cond_active, temperature, confidence_accumulator=conf_acc, return_confidence=True
@@ -1065,16 +1040,29 @@ class MAR(nn.Module):
                 if u_map is None or u_map.numel() == 0:
                     u_map = torch.zeros(z_cond_active.shape[0], device=z_cond_active.device, dtype=z_cond_active.dtype)
                 
-                # 5. === 动态筛选与更新 (Active Batch Update) ===
-                u_std = standardize(u_map, mu_u, sigma_u)
+                # === 1. 恢复：使用真实的置信度标准化 ===
+                u_std = standardize(u_map, mu_u, sigma_u) # [N_masked]
+
+                # =======================================================
+                # [新增] 方案一：Stochastic Ranking (随机扰动)
+                # =======================================================
+                # 引入受控的随机噪声，解决"尺子偏科"问题 (平滑性偏差)
+                # 这会让高频纹理(高方差)有机会因为加上了有利的噪声而被保留
+                stochastic_scale = 0.5 # 经验值：0.2~1.0 之间调整
+                noise = torch.randn_like(u_std)
+                u_std = u_std + noise * stochastic_scale
+                # =======================================================
+
                 u_std_flat = u_std.reshape(-1)
-                num_masked = u_std_flat.shape[0] # 当前 Batch 总共剩下的 Mask 数
+                num_masked = u_std_flat.shape[0]
                 
-                pass_mask_flat = u_std_flat < self.conf_threshold
+                # === 2. 计算当前的动态阈值 ===
+                progress = min(round_idx / ramp_steps, 1.0)
+                current_threshold = start_threshold + (end_threshold - start_threshold) * progress
                 
-                # [关键修正] 线性保底机制：基于活跃 Batch 的总容量计算
-                # 规则：每轮至少揭开 "活跃样本数 * 序列长度 * 比例" 个 Token
-                # 这样即使只剩一张难图，也会按它的 5% 快速推进，不会卡死
+                pass_mask_flat = u_std_flat < current_threshold
+                
+                # 线性保底 (Safety Net)
                 global_min_tokens = math.ceil(curr_bsz_active * self.seq_len * self.conf_pmin)
                 safety_min = min(num_masked, max(1, global_min_tokens))
                 
@@ -1084,11 +1072,10 @@ class MAR(nn.Module):
                 
                 fail_mask_flat = ~pass_mask_flat
 
-                # 获取对应的索引 (相对于 active batch)
+                # 更新 Token
                 pass_indices = (indices_to_pred_active[0][pass_mask_flat], indices_to_pred_active[1][pass_mask_flat])
                 fail_indices = (indices_to_pred_active[0][fail_mask_flat], indices_to_pred_active[1][fail_mask_flat])
                 
-                # 更新 Active Tokens
                 cur_tokens_active = tokens_active.clone()
                 cur_tokens_active[pass_indices] = sampled_token_latent[pass_mask_flat]
                 
@@ -1098,41 +1085,30 @@ class MAR(nn.Module):
                     else:
                         cur_tokens_active[fail_indices] = 0 
                 
-                # 更新 Active Mask
                 mask_active[pass_indices] = 0
-
-                # 6. === 写回全局状态 (Scatter Update) ===
-                # 将计算好的 active 部分写回全局 Tensor
                 tokens[active_indices] = cur_tokens_active
                 mask[active_indices] = mask_active
 
-                # 7. === 检查哪些样本完成了 ===
-                # 对每个样本检查 mask 是否全为 0
-                is_finished = (mask_active.sum(dim=-1) == 0) # [K]
+                is_finished = (mask_active.sum(dim=-1) == 0)
                 if is_finished.any():
-                    # 找到已经完成的样本在全局中的索引，将其标记为 False
                     finished_global_indices = active_indices[is_finished]
                     unfinished_batch_mask[finished_global_indices] = False
 
-                # 日志打印
                 if is_main_process():
                     accepted = pass_mask_flat.sum().item()
                     remaining_global = mask.sum().item()
                     print(
                         f"[Dynamic-MaskGIT] Round {round_idx}: "
-                        f"Active {curr_bsz_active}/{bsz}, " # 显示当前还有几张图在跑
+                        f"Thresh {current_threshold:.2f}, "
+                        f"Active {curr_bsz_active}/{bsz}, "
                         f"Accepted {accepted}, Remaining {remaining_global}"
                     )
                 
                 round_idx += 1
-            # 记录实际步数
             actual_steps = round_idx
-        # 循环结束后，记录实际跑了多少轮
-            actual_steps = round_idx
-        # unpatchify
+            
         tokens = self.unpatchify(tokens, shape=shape_hr)
         return tokens, actual_steps
-
 
 def mar_base(**kwargs):
     model = MAR(

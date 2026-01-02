@@ -10,7 +10,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --vae_stride 16 \
     --patch_size 1 \
     --batch_size 1 \
-    --eval_bsz 1 \
+    --eval_bsz 16 \
     --img_size 512 \
     --resume output_Resume \
     --evaluate \
@@ -19,10 +19,11 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --lr_data_path /root/autodl-tmp/zanding/CelebA-Test-400/LQ \
     --use_lr_inject \
     --use_rope \
-    --use_mse_loss \
     --use_dynamic_maskgit \
-    --conf_threshold "0.0" \
-    --conf_pmin 0.02 \
+    --conf_threshold "-0.5" \
+    --conf_pmin 0.05 \
+    --use_mse_loss \
     --conf_window '40:10' \
-    --output_dir Evaluate_Resume_0.0_0.02_40:10_1
+    --output_dir Evaluate_Resume_-0.5_0.05_40:10_16_-1.5-1.0_0.5
+    
 
