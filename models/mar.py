@@ -1034,7 +1034,7 @@ class MAR(nn.Module):
                 end_threshold = self.conf_threshold + 1.5
 
             ramp_steps = 6.0
-            stochastic_scale = 0.5 # 随机扰动系数
+            stochastic_scale = 0.3 # 随机扰动系数
 
             # 动态导入 TrajectoryAccumulator (防止顶层循环导入)
             from models.confidence.variance_confidence import TrajectoryConfidenceAccumulator, VarianceConfidenceAccumulator

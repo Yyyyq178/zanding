@@ -451,7 +451,7 @@ def save_sr_hr_images(sr, hr, filenames, sr_dir, hr_dir, batch_idx):
         if not base_name:
             base_name = f"batch{batch_idx}_img{idx}"
 
-        prefix = f"rank{rank}_{base_name}"
+        prefix = f"{base_name}"
         sr_path = os.path.join(sr_dir, f"{prefix}.png")
         hr_path = os.path.join(hr_dir, f"{prefix}.png")
 

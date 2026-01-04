@@ -10,7 +10,7 @@ export MASTER_PORT=29501
 # --hr_data_path      -> 指向你的 HR 数据集根目录
 
 torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
-    --model mar_base \
+    --model mar_huge \
     --diffloss_d 6 \
     --diffloss_w 1024 \
     --vae_path pretrained_models/vae/kl16.ckpt \
@@ -18,15 +18,15 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --vae_embed_dim 16 \
     --vae_stride 16 \
     --patch_size 1 \
-    --epochs 400 \
+    --epochs 600 \
     --warmup_epochs 10 \
     --batch_size 8 \
     --grad_clip 1.0 \
-    --steps_per_epoch 250 \
+    --steps_per_epoch 500 \
     --blr 2.0e-2 \
     --hr_data_path /root/autodl-tmp/zanding/data \
     --val_data_path /root/autodl-tmp/zanding/data \
-    --output_dir output_Resume \
+    --output_dir output_Huge \
     --degradation codeformer \
     --eval_freq 4 \
     --save_last_freq 2 \
@@ -38,4 +38,3 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --use_rope \
     --use_mse_loss \
     --online_eval
-#   --resume output_sr_train_10:2:1_inject \
