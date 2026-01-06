@@ -59,6 +59,9 @@ def get_args_parser():
                         help='number of images to generate')
     parser.add_argument('--use_dynamic_maskgit', action='store_true',
                         help='Use dynamic MaskGIT with variance confidence (inference only)')
+    parser.add_argument('--conf_method', type=str, default='entropy', 
+                    choices=['entropy', 'stats'],
+                    help='Confidence method: entropy (Scheme 1) or stats (Scheme 2/3)')
     parser.add_argument('--conf_threshold', type=float, default=0.0,
                         help='Confidence threshold tau for accepting tokens')
     parser.add_argument('--conf_pmin', type=float, default=0.01,
@@ -342,14 +345,14 @@ def main(args):
                     if v.shape == model_dict[new_k].shape:
                         valid_dict[new_k] = v
                     else:
-                        print(f"⚠️ Shape mismatch: {new_k} (ckpt: {v.shape} vs model: {model_dict[new_k].shape})")
+                        print(f"Shape mismatch: {new_k} (ckpt: {v.shape} vs model: {model_dict[new_k].shape})")
             # ========================================
 
             swinir_model.load_state_dict(valid_dict, strict=True) # 这里可以放心开 strict=True 了，或者保持 False
-            print(f"✅ Successfully loaded {len(valid_dict)} / {len(model_dict)} keys for SwinIR.")
+            print(f"Successfully loaded {len(valid_dict)} / {len(model_dict)} keys for SwinIR.")
             
             if len(valid_dict) == 0:
-                raise RuntimeError("❌ Error: Loaded 0 keys! Checkpoint matching failed.")
+                raise RuntimeError("Error: Loaded 0 keys! Checkpoint matching failed.")
         else:
             print(f"Warning: SwinIR weight not found at {args.swinir_ckpt}. Using random init (NOT RECOMMENDED).")
 
@@ -380,6 +383,7 @@ def main(args):
         use_rope=args.use_rope,
         use_mse_loss=args.use_mse_loss,
         use_dynamic_maskgit=args.use_dynamic_maskgit,
+        conf_method=args.conf_method,
         conf_threshold=args.conf_threshold,
         conf_pmin=args.conf_pmin,
         conf_window=args.conf_window,

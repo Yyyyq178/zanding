@@ -109,14 +109,14 @@ class RoPEAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, freqs_cis=None):
+    def forward(self, x, freqs_cis=None, return_entropy=False):
         B, N, C = x.shape
         # qkv: [3, B, num_heads, N, head_dim]
         # 注意这里 permute 成了 (2, 0, 3, 1, 4) -> [3, B, H, N, D]
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        # === 注入 RoPE (VARSR 风格) ===
+        # === 注入 RoPE ===
         if freqs_cis is not None:
             # apply_rotary_emb 期望输入为 [B, L, H, D]
             # 当前 q, k 是 [B, H, L, D]，需要 permute
@@ -126,22 +126,39 @@ class RoPEAttention(nn.Module):
             q = q.transpose(1, 2) # -> [B, H, L, D]
             k = k.transpose(1, 2)
         # ============================
-
-        dropout_p = self.attn_drop.p if self.training else 0.0
-
-        # 调用 SDPA
-        x = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=None,  # MAR 是双向 Attention，通常不需要 mask，除非你有特殊的 padding mask
-            dropout_p=dropout_p,
-            scale=self.scale # 如果不传，默认是 1/sqrt(head_dim)，和你原来的一样
-        )
-
+        
+        entropy = None
+        if return_entropy:
+            # 1. 手动计算 Attention 以获取分布 (为了求熵)
+            # q, k: [B, H, N, D]
+            # 使用 float32 保证数值稳定性
+            attn_logits = (q.float() @ k.float().transpose(-2, -1)) * self.scale
+            attn_probs = attn_logits.softmax(dim=-1)
+            
+            # 2. 计算香农熵: -Sum(p * log(p))
+            eps = 1e-10
+            # dim=-1 是对每个 token 的关注分布求熵
+            entropy_per_head = -torch.sum(attn_probs * torch.log(attn_probs + eps), dim=-1)
+            
+            # 3. 对 Head 维度求平均，得到每个 Token 的平均熵 [B, N]
+            entropy = entropy_per_head.mean(dim=1)
+            
+            # 4. 计算输出 (恢复原有精度)
+            x = attn_probs.to(q.dtype) @ v
+            if self.training:
+                x = self.attn_drop(x)
+        else:
+            # 保持原有的高效实现
+            dropout_p = self.attn_drop.p if self.training else 0.0
+            x = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, dropout_p=dropout_p, scale=self.scale
+            )
         # 调整输出形状 (SDPA 输出是 [B, H, N, D])
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x
+
+        return x, entropy
 class CrossAttention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
@@ -219,9 +236,10 @@ class RoPEBlock(nn.Module):
             self.lr_inject_gate = None
             
     def forward(self, x, freqs_cis=None, cond_tokens=None, gate_multiplier=1.0,
-                cross_attn_freqs_q=None, cross_attn_freqs_k=None):
+                cross_attn_freqs_q=None, cross_attn_freqs_k=None, return_entropy=False):
         # 将 freqs_cis 传入 Attention
-        x = x + self.drop_path(self.attn(self.norm1(x), freqs_cis=freqs_cis))
+        attn_out, entropy = self.attn(self.norm1(x), freqs_cis=freqs_cis, return_entropy=return_entropy)
+        x = x + self.drop_path(attn_out)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         if self.cross_attn is not None and cond_tokens is not None:
             if not torch.is_tensor(gate_multiplier):
@@ -233,7 +251,7 @@ class RoPEBlock(nn.Module):
                 freqs_cis_k=cross_attn_freqs_k
             )
             x = x + self.drop_path(cross_out) * gate_multiplier * self.lr_inject_gate
-        return x
+        return x, entropy
     
 def precompute_freqs_cis_2d(dim: int, coords_h, coords_w, theta: float = 10000.0):
     """
@@ -340,8 +358,6 @@ class MAR(nn.Module):
                  mlp_ratio=4., norm_layer=nn.LayerNorm,
                  vae_embed_dim=16,
                  mask_ratio_min=0.7,
-                 #label_drop_prob=0.1,
-                 #class_num=1000,
                  attn_dropout=0.1,
                  proj_dropout=0.1,
                  buffer_size=64,   #这里需要设置为LR转码后的长度
@@ -360,6 +376,7 @@ class MAR(nn.Module):
                  conf_threshold: float = 0.0,
                  conf_pmin: float = 0.01,
                  conf_window: str = "40:10",
+                 conf_method='entropy',
                  ):
         super().__init__()
 
@@ -383,6 +400,7 @@ class MAR(nn.Module):
         self.conf_threshold = conf_threshold
         self.conf_pmin = conf_pmin
         self.conf_window = conf_window
+        self.conf_method = conf_method
         self.remask_mode = "mask_token"
         self.conf_stats_path = None
         self._conf_stats_cache = None
@@ -719,7 +737,6 @@ class MAR(nn.Module):
         head_dim = embed_dim // num_heads
 
         # 拼接 Features
-        # [修改] 移除中间定义的 pos_embed 变量和加法
         x = torch.cat([lr_embedding, hr_embedding], dim=1)
 
         num_lr_tokens = shape_lr[0] * shape_lr[1]
@@ -732,7 +749,6 @@ class MAR(nn.Module):
             freqs_cis_lr = None
 
         # 构造 Mask (LR 永远可见)
-        #num_lr_tokens = shape_lr[0] * shape_lr[1]
         mask_with_buffer = torch.cat([torch.zeros(bsz, num_lr_tokens, device=x.device), mask], dim=1)
 
         x = self.z_proj_ln(x)
@@ -742,29 +758,31 @@ class MAR(nn.Module):
         # Dropping (同时筛选 Feature 和 频率)
         keep_indices = (1 - mask_with_buffer).nonzero(as_tuple=True)
         
-        # 计算保留的 token 数量 (假设 batch 内一致，通常 MAR 设计也是如此)
+        # 计算保留的 token 数量
         num_kept = int(mask_with_buffer.shape[1] - mask_with_buffer.sum(dim=1)[0].item())
         
         # 筛选 Feature
         x = x[keep_indices].reshape(bsz, num_kept, embed_dim)
         
-        # [新增] 筛选 Frequencies
+        # 筛选 Frequencies
         freqs_cis_kept = None if freqs_cis_full is None else freqs_cis_full[keep_indices].reshape(bsz, num_kept, -1)
 
         # Apply Transformer Blocks (传入 freqs_cis)
         if cond_tokens is not None:
             assert cond_tokens.shape[0] == x.shape[0], "cond_tokens batch mismatch with encoder tokens."
             assert cond_tokens.shape[-1] == embed_dim, "cond_tokens dim mismatch with encoder embed dim."
+        
         for idx, block in enumerate(self.encoder_blocks):
             if self.grad_checkpointing and not torch.jit.is_scripting():         
-                # [修改] 传入 freqs_cis=freqs_cis_kept
                 gate_multiplier_tensor = x.new_tensor(gate_multiplier)
-                x = checkpoint(
+                # [关键修改] 这里必须要解包，因为 block 返回的是 (x, entropy)
+                x, _ = checkpoint(
                     block, x, freqs_cis_kept, cond_tokens, gate_multiplier_tensor,
                     freqs_cis_kept, freqs_cis_lr
                 )
             else:
-                x = block(x, freqs_cis=freqs_cis_kept, cond_tokens=cond_tokens,
+                # [关键修改] 这里必须要解包
+                x, _ = block(x, freqs_cis=freqs_cis_kept, cond_tokens=cond_tokens,
                           gate_multiplier=gate_multiplier,
                           cross_attn_freqs_q=freqs_cis_kept, cross_attn_freqs_k=freqs_cis_lr)
         x = self.encoder_norm(x)
@@ -772,7 +790,7 @@ class MAR(nn.Module):
         return x
 
     def forward_mae_decoder(self, x, mask, shape_hr, shape_lr,
-                            cond_tokens=None, gate_multiplier=1.0):
+                            cond_tokens=None, gate_multiplier=1.0, return_entropy=False):
         x = self.decoder_embed(x)
         num_lr_tokens = shape_lr[0] * shape_lr[1]
         bsz = x.shape[0]
@@ -792,8 +810,6 @@ class MAR(nn.Module):
 
         if self.use_rope:
             freqs_cis_full = self.get_rope_freqs(shape_hr, shape_lr, x.device, head_dim)
-            # 注意：这里不需要 repeat 到 batch 维度，apply_rotary_emb 会处理广播，
-            # 或者为了保险起见，跟 Encoder 保持一致：
             freqs_cis_full = freqs_cis_full.repeat(bsz, 1, 1) 
         else:
             freqs_cis_full = None
@@ -803,38 +819,57 @@ class MAR(nn.Module):
             x = x + pos_embed
 
         # Apply Transformer Blocks
+        last_layer_idx = len(self.decoder_blocks) - 1
+        final_entropy = None
+
         if cond_tokens is not None:
             assert cond_tokens.shape[0] == x.shape[0], "cond_tokens batch mismatch with decoder tokens."
             assert cond_tokens.shape[-1] == embed_dim, "cond_tokens dim mismatch with decoder embed dim."
-        if self.grad_checkpointing and not torch.jit.is_scripting():
-            for idx, block in enumerate(self.decoder_blocks):
-                # [修改] 传入 freqs_cis
+            
+        for idx, block in enumerate(self.decoder_blocks):
+            # 只有最后一层计算 Entropy
+            should_return_entropy = return_entropy and (idx == last_layer_idx)
+            
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                # Grad checkpointing doesn't support multiple outputs easily, assume inference
                 gate_multiplier_tensor = x.new_tensor(gate_multiplier)
-                x = checkpoint(
+                # [关键修改] 解包 checkpoint 返回的元组
+                ret = checkpoint(
                     block, x, freqs_cis_full, cond_tokens, gate_multiplier_tensor,
                     freqs_cis_full, freqs_cis_full[:, :num_lr_tokens] if freqs_cis_full is not None else None
                 )
-        else:
-            for idx, block in enumerate(self.decoder_blocks):
-                x = block(x, freqs_cis=freqs_cis_full, cond_tokens=cond_tokens,
-                          gate_multiplier=gate_multiplier,
-                          cross_attn_freqs_q=freqs_cis_full,
-                          cross_attn_freqs_k=freqs_cis_full[:, :num_lr_tokens] if freqs_cis_full is not None else None)
+                if isinstance(ret, tuple):
+                    x = ret[0]
+                else:
+                    x = ret
+                
+                block_entropy = None # Checkpointing disables this feature
+            else:
+                x, block_entropy = block(
+                    x, freqs_cis=freqs_cis_full, cond_tokens=cond_tokens,
+                    gate_multiplier=gate_multiplier,
+                    cross_attn_freqs_q=freqs_cis_full,
+                    cross_attn_freqs_k=freqs_cis_full[:, :num_lr_tokens] if freqs_cis_full is not None else None,
+                    return_entropy=should_return_entropy
+                )
+            
+            if should_return_entropy:
+                final_entropy = block_entropy
+
         x = self.decoder_norm(x)
 
         # 移除 Buffer (LR tokens)
         x = x[:, num_lr_tokens:]
+        if final_entropy is not None:
+             final_entropy = final_entropy[:, num_lr_tokens:]
 
-        # 这里调用get_2d_sincos_pos_embed_torch 函数
-        # 使用 self.seq_h 作为 base_size 保持一致性
         pos_embed = get_2d_sincos_pos_embed_torch(
             self.decoder_embed.out_features, shape_hr, shape_lr, x.device, base_size=self.seq_h
         )
-        # 只取 HR 部分的位置编码
         pos_embed_hr_only = pos_embed[:, num_lr_tokens:, :]
-        # 将位置编码扩展到当前的 Batch Size
         pos_embed_hr_only = pos_embed_hr_only.expand(bsz, -1, -1)
-        return x, pos_embed_hr_only
+        
+        return x, pos_embed_hr_only, final_entropy
 
     def forward_loss(self, z, pos_embed, target, mask):
         # z: Decoder 预测出的 Latent 特征 [Batch, Seq_Len, Dim]
@@ -984,60 +1019,73 @@ class MAR(nn.Module):
                 tokens = cur_tokens.clone()
         else:
             # =======================================================
-            # 优化版 Dynamic MaskGIT: 支持 轨迹稳定性 (Trajectory Stability)
+            # 优化版 Dynamic MaskGIT: 支持多方案 (Entropy / Stats)
             # =======================================================
-            window_steps = self._get_confidence_window()
-            if not window_steps:
-                window_steps = list(range(self.diffloss.gen_diffusion.num_timesteps))
             
-            # 加载统计量 (需要确保 _get_confidence_stats 已更新以支持 sigma_delta)
-            stats = self._get_confidence_stats(tokens.device)
-            
-            # 模式判断
-            is_trajectory_mode = False
-            mu_u, sigma_u = None, None
-            sigma_delta = None
+            # 动态导入防止顶层循环依赖
+            from models.confidence.variance_confidence import TrajectoryConfidenceAccumulator, VarianceConfidenceAccumulator
 
-            if stats is not None:
-                if isinstance(stats, tuple):
-                    # 旧版: Variance Mode
-                    mu_u, sigma_u = stats
+            use_entropy = (self.conf_method == "entropy")
+            
+            # --- 模式判断逻辑 ---
+            window_steps = None
+            is_trajectory_mode = False
+            sigma_delta = None
+            mu_u, sigma_u = None, None
+            
+            if not use_entropy:
+                # Stats Mode (Legacy Variance or Trajectory)
+                window_steps = self._get_confidence_window()
+                if not window_steps:
+                    window_steps = list(range(self.diffloss.gen_diffusion.num_timesteps))
+                
+                stats = self._get_confidence_stats(tokens.device)
+                if stats is not None:
+                    if isinstance(stats, tuple):
+                        mu_u, sigma_u = stats
+                    else:
+                        sigma_delta = stats
+                        is_trajectory_mode = True
                 else:
-                    # 新版: Trajectory Mode (stats 即为 sigma_delta Tensor)
-                    sigma_delta = stats
+                    # 默认回退到 Trajectory
                     is_trajectory_mode = True
-            else:
-                # 默认回退到 Trajectory 模式 (使用全1 sigma)
-                is_trajectory_mode = True
-                sigma_delta = torch.ones(1, self.token_embed_dim, 1, 1, device=tokens.device)
+                    sigma_delta = torch.ones(1, self.token_embed_dim, 1, 1, device=tokens.device)
 
             if is_main_process():
-                mode_str = "Trajectory Stability (Energy)" if is_trajectory_mode else "Prediction Variance (Z-Score)"
-                print(f"[Dynamic-MaskGIT] Running in {mode_str} mode.")
+                if use_entropy:
+                    print(f"[Dynamic-MaskGIT] Running in Attention Entropy Mode (Scheme 1).")
+                elif is_trajectory_mode:
+                    print(f"[Dynamic-MaskGIT] Running in Trajectory Stability Mode (Scheme 3).")
+                else:
+                    print(f"[Dynamic-MaskGIT] Running in Variance Mode (Scheme 2).")
 
             round_idx = 0
             unfinished_batch_mask = torch.ones(bsz, dtype=torch.bool, device=tokens.device)
-
-            # === [配置] 动态参数 ===
-            # 注意：Trajectory 模式下，能量值 >= 0。0 表示完全收敛。
-            # 如果是 Trajectory 模式，Threshold 应该是正数 (如 0.2)。
-            # 如果是 Variance 模式，Threshold 通常是负数 (如 -0.5)。
-            # 这里需要根据 conf_threshold 基础值进行相对调整。
+            saved_confidence = torch.full((bsz, num_hr_tokens), -1.0, device=device)
             
-            if is_trajectory_mode:
-                # 能量越小越好。
-                start_threshold = max(0.0, self.conf_threshold - 0.4)
-                end_threshold = self.conf_threshold + 0.2
+            # === [新增] Remask 参数 ===
+            remask_rate = 0.02 # 每次回退 0.5%
+            num_remask = max(1, int(num_hr_tokens * remask_rate))
+
+            # --- 动态阈值配置 ---
+            if use_entropy:
+                # Attention Entropy: 越小越好 (Range: 0~6)
+                start_threshold = max(0.01, self.conf_threshold - 0.2)
+                end_threshold = self.conf_threshold + 0.3
+                ramp_steps = 6.0
+                stochastic_scale = 1.0
+            elif is_trajectory_mode:
+                # Energy: 越小越好 (Range: 0+)
+                start_threshold = max(0.0, self.conf_threshold - 0.5)
+                end_threshold = self.conf_threshold + 0.1
+                ramp_steps = 6.0
+                stochastic_scale = 0.2
             else:
-                # 方差越小越好 (Z-Score)。
+                # Z-Score: 越小越好 (Range: -3~3)
                 start_threshold = self.conf_threshold - 1.0
                 end_threshold = self.conf_threshold + 1.5
-
-            ramp_steps = 6.0
-            stochastic_scale = 0.3 # 随机扰动系数
-
-            # 动态导入 TrajectoryAccumulator (防止顶层循环导入)
-            from models.confidence.variance_confidence import TrajectoryConfidenceAccumulator, VarianceConfidenceAccumulator
+                ramp_steps = 6.0
+                stochastic_scale = 1.0
 
             while unfinished_batch_mask.any():
                 active_indices = torch.nonzero(unfinished_batch_mask).squeeze(1)
@@ -1054,9 +1102,11 @@ class MAR(nn.Module):
                 if torch.is_tensor(gate_multiplier) and gate_multiplier.shape[0] == bsz:
                     gate_mul_active = gate_multiplier[active_indices]
 
-                # Transformer Forward (串行处理变长 Batch)
+                # --- Forward ---
                 z_list = []
                 pos_embed_list = []
+                entropy_list = []
+                
                 for i in range(curr_bsz_active):
                     t_i = tokens_active[i:i+1]; m_i = mask_active[i:i+1]; l_i = lr_tokens_active[i:i+1]
                     c_enc_i = cond_enc_active[i:i+1] if cond_enc_active is not None else None
@@ -1064,11 +1114,13 @@ class MAR(nn.Module):
                     g_mul_i = gate_mul_active[i:i+1] if torch.is_tensor(gate_mul_active) else gate_mul_active
 
                     x_i = self.forward_mae_encoder(t_i, m_i, l_i, shape_hr, shape_lr, cond_tokens=c_enc_i, gate_multiplier=g_mul_i)
-                    z_i, pos_i = self.forward_mae_decoder(x_i, m_i, shape_hr, shape_lr, cond_tokens=c_dec_i, gate_multiplier=g_mul_i)
+                    z_i, pos_i, ent_i = self.forward_mae_decoder(x_i, m_i, shape_hr, shape_lr, cond_tokens=c_dec_i, gate_multiplier=g_mul_i, return_entropy=use_entropy)
                     z_list.append(z_i); pos_embed_list.append(pos_i)
+                    if use_entropy: entropy_list.append(ent_i)
                 
                 z_active = torch.cat(z_list, dim=0)
                 pos_embed_active = torch.cat(pos_embed_list, dim=0)
+                entropy_active = torch.cat(entropy_list, dim=0) if use_entropy else None
 
                 mask_to_pred_active = mask_active.bool()
                 indices_to_pred_active = mask_to_pred_active.nonzero(as_tuple=True)
@@ -1081,46 +1133,56 @@ class MAR(nn.Module):
                 pos_sub_active = pos_embed_active[indices_to_pred_active]
                 z_cond_active = z_sub_active + pos_sub_active
 
-                # === 采样与置信度计算 ===
-                if is_trajectory_mode:
-                    # 使用差分能量累积器 (传入标定好的 sigma_delta)
-                    conf_acc = TrajectoryConfidenceAccumulator(window_steps, sigma_delta=sigma_delta)
-                else:
-                    # 使用旧版方差累积器
-                    conf_acc = VarianceConfidenceAccumulator(window_steps)
-
-                sampled_token_latent, u_map = self.diffloss.sample(
-                    z_cond_active, temperature, confidence_accumulator=conf_acc, return_confidence=True
-                )
+                # --- 采样与置信度获取 ---
+                u_map = None
+                sampled_token_latent = None
                 
+                if use_entropy:
+                    # Entropy Mode: 从 Transformer 获取 Entropy，DiffLoss 只负责采样
+                    sampled_token_latent = self.diffloss.sample(
+                        z_cond_active, temperature, return_confidence=False
+                    )
+                    # 从 entropy_active 中提取对应位置的值
+                    u_map = entropy_active[indices_to_pred_active]
+                else:
+                    # Stats Mode: 使用 Accumulator 在 DiffLoss 内部计算
+                    conf_acc = None
+                    if is_trajectory_mode:
+                        conf_acc = TrajectoryConfidenceAccumulator(window_steps, sigma_delta=sigma_delta)
+                    else:
+                        conf_acc = VarianceConfidenceAccumulator(window_steps)
+                    
+                    sampled_token_latent, u_map_raw = self.diffloss.sample(
+                        z_cond_active, temperature, confidence_accumulator=conf_acc, return_confidence=True
+                    )
+                    
+                    # 标准化
+                    if is_trajectory_mode:
+                         u_map = u_map_raw # 能量值本身就是物理量
+                    else:
+                         u_map = standardize(u_map_raw, mu_u, sigma_u)
+
                 if u_map is None or u_map.numel() == 0:
                     u_map = torch.zeros(z_cond_active.shape[0], device=z_cond_active.device)
                 
-                # === 归一化/标准化 ===
-                if is_trajectory_mode:
-                    # u_map 已经是归一化的能量值 (Delta / Sigma)^2
-                    # 不需要再做 Z-Score，因为它本身就是绝对物理量
-                    u_std = u_map 
-                else:
-                    # 旧版需要标准化
-                    u_std = standardize(u_map, mu_u, sigma_u)
+                u_std = u_map
 
-                # === Stochastic Ranking (随机扰动) ===
-                # 依然适用：给不确定性高(Energy大/Variance大)的Token一个随机变小的机会
+                # --- Stochastic Ranking ---
                 noise = torch.randn_like(u_std)
                 u_std = u_std + noise * stochastic_scale
+                
                 if is_main_process() and round_idx == 0:
                     print(f"DEBUG Score: Min={u_std.min():.3f}, Max={u_std.max():.3f}, Mean={u_std.mean():.3f}")
                 u_std_flat = u_std.reshape(-1)
                 num_masked = u_std_flat.shape[0]
                 
-                # === 动态阈值 ===
+                # --- 动态阈值筛选 ---
                 progress_ratio = min(round_idx / ramp_steps, 1.0)
                 current_threshold = start_threshold + (end_threshold - start_threshold) * progress_ratio
                 
                 pass_mask_flat = u_std_flat < current_threshold
                 
-                # 线性保底 (Safety Net)
+                # Safety Net
                 global_min_tokens = math.ceil(curr_bsz_active * self.seq_len * self.conf_pmin)
                 safety_min = min(num_masked, max(1, global_min_tokens))
                 
@@ -1144,6 +1206,47 @@ class MAR(nn.Module):
                         cur_tokens_active[fail_indices] = 0 
                 
                 mask_active[pass_indices] = 0
+                if pass_mask_flat.any():
+                    # 映射回 global batch index
+                    # indices_to_pred_active 是局部索引，active_indices 是全局索引
+                    acc_local_b = indices_to_pred_active[0][pass_mask_flat]
+                    acc_t = indices_to_pred_active[1][pass_mask_flat]
+                    acc_global_b = active_indices[acc_local_b]
+                    
+                    # 记录分数 (u_map 是当前的置信度/能量，值越高代表越不稳定/越差)
+                    saved_confidence[acc_global_b, acc_t] = u_map[pass_mask_flat]
+
+                # === [新增] 2. Remask (反悔) 逻辑 ===
+                # 遍历当前 batch 中的每张图
+                for i in range(curr_bsz_active):
+                    global_idx = active_indices[i]
+                    local_idx = i
+                    # 策略：当剩余 Mask 比例低于 5% 时，强制停止 Remask，确保收敛。
+                    # =========================================================
+                    current_mask_count = mask_active[local_idx].sum().item()
+                    current_ratio = current_mask_count / num_hr_tokens
+                    
+                    # 如果剩余未填的少于 5%，或者已经填完了，就跳过 Remask
+                    if current_ratio < 0.05: 
+                        continue
+                    # 找到目前已揭开的位置 (mask == 0)
+                    known_mask = (mask_active[local_idx] == 0)
+                    known_indices = known_mask.nonzero(as_tuple=True)[0]
+                    
+                    # 只有当已揭开的数量足够多时才 Remask
+                    if len(known_indices) > num_remask:
+                        # 获取这些位置当初的分数
+                        # X_0 模式下：分数(能量)越高 = 越差
+                        scores = saved_confidence[global_idx, known_indices]
+                        
+                        # 找出分数最高的 k 个 (Worst K)
+                        topk = torch.topk(scores, k=num_remask, largest=True)
+                        
+                        # 获取对应的 token index
+                        candidates_idx = known_indices[topk.indices]
+                        
+                        # 重新把它们 Mask 掉 (设为 1)
+                        mask_active[local_idx, candidates_idx] = 1
                 tokens[active_indices] = cur_tokens_active
                 mask[active_indices] = mask_active
 

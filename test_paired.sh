@@ -19,10 +19,11 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --use_lr_inject \
     --use_rope \
     --use_dynamic_maskgit \
+    --conf_method stats \
     --conf_threshold 1.0 \
     --conf_pmin 0.05 \
     --use_mse_loss \
     --conf_window '40:10' \
-    --output_dir Evaluate_Resume_X0_1.0_0.05_40:10_16_0.6-1.2_0.3
+    --output_dir Evaluate_Resume_X0_1.0_0.05_40:10_16_0.5-1.1_0.2_remask_2.0%
     
 
