@@ -4,7 +4,87 @@ from typing import Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
+class CosineTrajectoryAccumulator:
+    """
+    方案4实现：基于 x0 轨迹方向一致性的置信度 (Cosine Similarity)。
+    
+    逻辑：
+    1. 计算每一步的更新向量: delta_t = x0_current - x0_prev
+    2. 计算相邻两个更新向量的余弦相似度: sim = CosineSim(delta_t, delta_prev)
+    3. 定义不确定性 (Uncertainty) = 1 - sim
+       (sim 越接近 1，表示方向一致，不确定性越低；sim 越小，表示方向抖动，不确定性越高)
+    """
+    def __init__(self, window_steps: Sequence[int], eps: float = 1e-6):
+        self.window_steps: Set[int] = set(int(s) for s in window_steps)
+        self.eps = eps
+        self.reset()
+
+    def reset(self) -> None:
+        self.u_accum = None    # 累积的不确定性分数
+        self.x0_prev = None    # 上一步预测的 x0
+        self.delta_prev = None # 上一步的更新向量
+        self.cnt = 0
+
+    def update(self, t: int, x_start: torch.Tensor, **kwargs) -> None:
+        """
+        Args:
+            t: 当前 timestep
+            x_start: 当前预测的 x0 [N, C] 或 [B, C, H, W]
+        """
+        if t not in self.window_steps:
+            return
+
+        # 自动探测维度 (Token模式 或 Image模式)
+        ndim = x_start.ndim
+        
+        # === 初始化累积器 ===
+        if self.u_accum is None:
+            if ndim == 2:
+                # Token模式: [N, C] -> 输出分数 [N]
+                N, C = x_start.shape
+                self.u_accum = torch.zeros(N, device=x_start.device, dtype=x_start.dtype)
+            elif ndim == 4:
+                # Image模式: [B, C, H, W] -> 输出分数 [B, H, W]
+                B, C, H, W = x_start.shape
+                self.u_accum = torch.zeros(B, H, W, device=x_start.device, dtype=x_start.dtype)
+            
+            # 第一步没有 delta，只记录 x0
+            self.x0_prev = x_start.detach().clone()
+            return
+
+        # === 计算当前步的 Delta ===
+        # current_delta 指向当前预测值的方向变化
+        current_delta = x_start - self.x0_prev
+        
+        # === 计算余弦相似度并累积 ===
+        if self.delta_prev is not None:
+            # 计算 Cosine Similarity
+            # dim=1 是 Channel 维度 (无论是 [N, C] 还是 [B, C, H, W])
+            sim = F.cosine_similarity(current_delta, self.delta_prev, dim=1, eps=self.eps)
+            
+            # 将 Similarity 转换为 Uncertainty (越小越好)
+            # Range: [0, 2] (Sim: 1 -> Unc: 0; Sim: -1 -> Unc: 2)
+            uncertainty = 1.0 - sim
+            
+            self.u_accum += uncertainty
+            self.cnt += 1
+        
+        # === 更新状态 ===
+        self.delta_prev = current_delta.detach().clone()
+        self.x0_prev = x_start.detach().clone()
+
+    def finalize(self) -> torch.Tensor:
+        """
+        返回平均不确定性 u_i
+        """
+        if self.u_accum is None or self.cnt == 0:
+            return torch.zeros(1)
+        
+        # 平均值
+        return self.u_accum / max(self.cnt, 1)
+    
 class TrajectoryConfidenceAccumulator:
     """
     MD方案实现：x0 轨迹差分能量累积器 (Trajectory Stability)

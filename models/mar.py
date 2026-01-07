@@ -1019,13 +1019,18 @@ class MAR(nn.Module):
                 tokens = cur_tokens.clone()
         else:
             # =======================================================
-            # 优化版 Dynamic MaskGIT: 支持多方案 (Entropy / Stats)
+            # 优化版 Dynamic MaskGIT: 支持 Entropy / Stats / Cosine
             # =======================================================
             
             # 动态导入防止顶层循环依赖
-            from models.confidence.variance_confidence import TrajectoryConfidenceAccumulator, VarianceConfidenceAccumulator
+            from models.confidence.variance_confidence import (
+                TrajectoryConfidenceAccumulator, 
+                VarianceConfidenceAccumulator,
+                CosineTrajectoryAccumulator 
+            )
 
             use_entropy = (self.conf_method == "entropy")
+            use_cosine = (self.conf_method == "cosine") 
             
             # --- 模式判断逻辑 ---
             window_steps = None
@@ -1033,8 +1038,8 @@ class MAR(nn.Module):
             sigma_delta = None
             mu_u, sigma_u = None, None
             
-            if not use_entropy:
-                # Stats Mode (Legacy Variance or Trajectory)
+            if not use_entropy and not use_cosine:
+                # Stats Mode (Legacy Variance or Trajectory Energy)
                 window_steps = self._get_confidence_window()
                 if not window_steps:
                     window_steps = list(range(self.diffloss.gen_diffusion.num_timesteps))
@@ -1047,13 +1052,15 @@ class MAR(nn.Module):
                         sigma_delta = stats
                         is_trajectory_mode = True
                 else:
-                    # 默认回退到 Trajectory
+                    # 默认回退到 Trajectory Energy
                     is_trajectory_mode = True
                     sigma_delta = torch.ones(1, self.token_embed_dim, 1, 1, device=tokens.device)
 
             if is_main_process():
                 if use_entropy:
                     print(f"[Dynamic-MaskGIT] Running in Attention Entropy Mode (Scheme 1).")
+                elif use_cosine:
+                    print(f"[Dynamic-MaskGIT] Running in Cosine Consistency Mode (New Scheme).")
                 elif is_trajectory_mode:
                     print(f"[Dynamic-MaskGIT] Running in Trajectory Stability Mode (Scheme 3).")
                 else:
@@ -1063,8 +1070,8 @@ class MAR(nn.Module):
             unfinished_batch_mask = torch.ones(bsz, dtype=torch.bool, device=tokens.device)
             saved_confidence = torch.full((bsz, num_hr_tokens), -1.0, device=device)
             
-            # === [新增] Remask 参数 ===
-            remask_rate = 0.02 # 每次回退 0.5%
+            # Remask 参数
+            remask_rate = 0.02 # 每次回退 2%
             num_remask = max(1, int(num_hr_tokens * remask_rate))
 
             # --- 动态阈值配置 ---
@@ -1074,6 +1081,15 @@ class MAR(nn.Module):
                 end_threshold = self.conf_threshold + 0.3
                 ramp_steps = 6.0
                 stochastic_scale = 1.0
+            elif use_cosine:
+                # === [新增] Cosine Mode 配置 ===
+                # Metric 是 (1 - CosineSim). Range [0, 2]
+                # 0=一致(好), 1=正交, 2=相反
+                # 推荐阈值: 0.2 ~ 0.5
+                start_threshold = max(0.0, self.conf_threshold - 0.1)
+                end_threshold = self.conf_threshold + 0.1
+                ramp_steps = 10.0
+                stochastic_scale = 0.0 # Cosine 数值较平滑，噪声给小一点
             elif is_trajectory_mode:
                 # Energy: 越小越好 (Range: 0+)
                 start_threshold = max(0.0, self.conf_threshold - 0.5)
@@ -1138,16 +1154,23 @@ class MAR(nn.Module):
                 sampled_token_latent = None
                 
                 if use_entropy:
-                    # Entropy Mode: 从 Transformer 获取 Entropy，DiffLoss 只负责采样
+                    # Entropy Mode
                     sampled_token_latent = self.diffloss.sample(
                         z_cond_active, temperature, return_confidence=False
                     )
-                    # 从 entropy_active 中提取对应位置的值
                     u_map = entropy_active[indices_to_pred_active]
                 else:
-                    # Stats Mode: 使用 Accumulator 在 DiffLoss 内部计算
+                    # Stats / Cosine Mode
                     conf_acc = None
-                    if is_trajectory_mode:
+                    if use_cosine:
+                        # === 使用 Cosine 累积器 ===
+                        # 窗口步数可以通过 self._get_confidence_window() 获取，或者直接全量
+                        cosine_window = self._get_confidence_window()
+                        if not cosine_window:
+                             # 如果未指定窗口，默认使用全部步数（或者你可以指定一个默认值）
+                             cosine_window = list(range(self.diffloss.gen_diffusion.num_timesteps))
+                        conf_acc = CosineTrajectoryAccumulator(cosine_window)
+                    elif is_trajectory_mode:
                         conf_acc = TrajectoryConfidenceAccumulator(window_steps, sigma_delta=sigma_delta)
                     else:
                         conf_acc = VarianceConfidenceAccumulator(window_steps)
@@ -1157,8 +1180,10 @@ class MAR(nn.Module):
                     )
                     
                     # 标准化
-                    if is_trajectory_mode:
-                         u_map = u_map_raw # 能量值本身就是物理量
+                    if use_cosine:
+                         u_map = u_map_raw # Cosine 不需要标准化 [0, 2]
+                    elif is_trajectory_mode:
+                         u_map = u_map_raw # Energy 不需要标准化
                     else:
                          u_map = standardize(u_map_raw, mu_u, sigma_u)
 
@@ -1207,46 +1232,34 @@ class MAR(nn.Module):
                 
                 mask_active[pass_indices] = 0
                 if pass_mask_flat.any():
-                    # 映射回 global batch index
-                    # indices_to_pred_active 是局部索引，active_indices 是全局索引
+                    # 记录分数
                     acc_local_b = indices_to_pred_active[0][pass_mask_flat]
                     acc_t = indices_to_pred_active[1][pass_mask_flat]
                     acc_global_b = active_indices[acc_local_b]
-                    
-                    # 记录分数 (u_map 是当前的置信度/能量，值越高代表越不稳定/越差)
                     saved_confidence[acc_global_b, acc_t] = u_map[pass_mask_flat]
 
-                # === [新增] 2. Remask (反悔) 逻辑 ===
-                # 遍历当前 batch 中的每张图
+                # === Remask逻辑 ===
+                '''
                 for i in range(curr_bsz_active):
                     global_idx = active_indices[i]
                     local_idx = i
-                    # 策略：当剩余 Mask 比例低于 5% 时，强制停止 Remask，确保收敛。
-                    # =========================================================
                     current_mask_count = mask_active[local_idx].sum().item()
                     current_ratio = current_mask_count / num_hr_tokens
                     
-                    # 如果剩余未填的少于 5%，或者已经填完了，就跳过 Remask
                     if current_ratio < 0.05: 
                         continue
-                    # 找到目前已揭开的位置 (mask == 0)
+                    
                     known_mask = (mask_active[local_idx] == 0)
                     known_indices = known_mask.nonzero(as_tuple=True)[0]
                     
-                    # 只有当已揭开的数量足够多时才 Remask
                     if len(known_indices) > num_remask:
-                        # 获取这些位置当初的分数
-                        # X_0 模式下：分数(能量)越高 = 越差
                         scores = saved_confidence[global_idx, known_indices]
-                        
                         # 找出分数最高的 k 个 (Worst K)
                         topk = torch.topk(scores, k=num_remask, largest=True)
-                        
-                        # 获取对应的 token index
                         candidates_idx = known_indices[topk.indices]
-                        
-                        # 重新把它们 Mask 掉 (设为 1)
                         mask_active[local_idx, candidates_idx] = 1
+                '''
+
                 tokens[active_indices] = cur_tokens_active
                 mask[active_indices] = mask_active
 
