@@ -14,6 +14,12 @@ from typing import List, Optional, Sequence, Tuple, Iterable
 from models.diffloss import DiffLoss
 from util.misc import is_main_process
 from models.confidence import VarianceConfidenceAccumulator, standardize, load_confidence_stats
+from models.confidence.variance_confidence import (
+                TrajectoryConfidenceAccumulator, 
+                VarianceConfidenceAccumulator,
+                CosineTrajectoryAccumulator,
+                SemanticConsistencyAccumulator
+            )
 
 # =========================================================================
 # RoPE 核心函数
@@ -1019,19 +1025,13 @@ class MAR(nn.Module):
                 tokens = cur_tokens.clone()
         else:
             # =======================================================
-            # 优化版 Dynamic MaskGIT: 支持 Entropy / Stats / Cosine
+            # 优化版 Dynamic MaskGIT
             # =======================================================
             
-            # 动态导入防止顶层循环依赖
-            from models.confidence.variance_confidence import (
-                TrajectoryConfidenceAccumulator, 
-                VarianceConfidenceAccumulator,
-                CosineTrajectoryAccumulator 
-            )
 
             use_entropy = (self.conf_method == "entropy")
             use_cosine = (self.conf_method == "cosine") 
-            
+            use_semantic = (self.conf_method == "semantic")
             # --- 模式判断逻辑 ---
             window_steps = None
             is_trajectory_mode = False
@@ -1058,13 +1058,16 @@ class MAR(nn.Module):
 
             if is_main_process():
                 if use_entropy:
-                    print(f"[Dynamic-MaskGIT] Running in Attention Entropy Mode (Scheme 1).")
+                    print(f"[Dynamic-MaskGIT] Running in Attention Entropy Mode.")
                 elif use_cosine:
-                    print(f"[Dynamic-MaskGIT] Running in Cosine Consistency Mode (New Scheme).")
+                    print(f"[Dynamic-MaskGIT] Running in Cosine Trajectory Mode.")
+                elif use_semantic:
+                    # 打印日志
+                    print(f"[Dynamic-MaskGIT] Running in Feature Semantic Consistency Mode (SR vs LR).")
                 elif is_trajectory_mode:
-                    print(f"[Dynamic-MaskGIT] Running in Trajectory Stability Mode (Scheme 3).")
+                    print(f"[Dynamic-MaskGIT] Running in Trajectory Stability Mode.")
                 else:
-                    print(f"[Dynamic-MaskGIT] Running in Variance Mode (Scheme 2).")
+                    print(f"[Dynamic-MaskGIT] Running in Variance Mode.")
 
             round_idx = 0
             unfinished_batch_mask = torch.ones(bsz, dtype=torch.bool, device=tokens.device)
@@ -1081,15 +1084,14 @@ class MAR(nn.Module):
                 end_threshold = self.conf_threshold + 0.3
                 ramp_steps = 6.0
                 stochastic_scale = 1.0
-            elif use_cosine:
-                # === [新增] Cosine Mode 配置 ===
+                # ===  Cosine Mode 配置 ===
                 # Metric 是 (1 - CosineSim). Range [0, 2]
                 # 0=一致(好), 1=正交, 2=相反
-                # 推荐阈值: 0.2 ~ 0.5
+            elif use_cosine or use_semantic:
                 start_threshold = max(0.0, self.conf_threshold - 0.1)
                 end_threshold = self.conf_threshold + 0.1
                 ramp_steps = 10.0
-                stochastic_scale = 0.0 # Cosine 数值较平滑，噪声给小一点
+                stochastic_scale = 0.0
             elif is_trajectory_mode:
                 # Energy: 越小越好 (Range: 0+)
                 start_threshold = max(0.0, self.conf_threshold - 0.5)
@@ -1170,6 +1172,21 @@ class MAR(nn.Module):
                              # 如果未指定窗口，默认使用全部步数（或者你可以指定一个默认值）
                              cosine_window = list(range(self.diffloss.gen_diffusion.num_timesteps))
                         conf_acc = CosineTrajectoryAccumulator(cosine_window)
+                    elif use_semantic:
+                        # === [Feature Semantic Consistency 实现核心] ===
+                        
+                        # 准备 Window (哪些步计算一致性)
+                        semantic_window = self._get_confidence_window()
+                        if not semantic_window:
+                             semantic_window = list(range(self.diffloss.gen_diffusion.num_timesteps))
+                        
+                        # 提取出当前需要生成的那些位置对应的 LR 特征
+                        target_lr_features = lr_tokens_active[indices_to_pred_active]
+                        
+                        conf_acc = SemanticConsistencyAccumulator(
+                            target_features=target_lr_features,  # <--- 传入切片后的特征
+                            window_steps=semantic_window
+                        )
                     elif is_trajectory_mode:
                         conf_acc = TrajectoryConfidenceAccumulator(window_steps, sigma_delta=sigma_delta)
                     else:
@@ -1180,7 +1197,7 @@ class MAR(nn.Module):
                     )
                     
                     # 标准化
-                    if use_cosine:
+                    if use_cosine or use_semantic:
                          u_map = u_map_raw # Cosine 不需要标准化 [0, 2]
                     elif is_trajectory_mode:
                          u_map = u_map_raw # Energy 不需要标准化

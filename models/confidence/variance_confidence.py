@@ -6,6 +6,70 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+
+class SemanticConsistencyAccumulator:
+    """
+    Scheme: Feature Semantic Consistency (特征语义一致性).
+    
+    计算预测的 SR Latent Features (pred_x0) 与条件 LR Latent Features (condition) 
+    之间的余弦相似度。
+    
+    逻辑:
+    Uncertainty = 1 - CosineSimilarity(pred_x0, condition_lr)
+    范围 [0, 2]，值越大表示越不确定（语义越不一致）。
+    """
+    def __init__(self, target_features: torch.Tensor, window_steps: Optional[Sequence[int]] = None, eps: float = 1e-6):
+        """
+        Args:
+            target_features: 作为参考的特征 (即 LR tokens)。Shape: [N, L, C]
+            window_steps: 参与计算的时间步 (default: all).
+        """
+        self.target_features = target_features
+        self.window_steps = set(int(s) for s in window_steps) if window_steps else None
+        self.eps = eps
+        self.reset()
+
+    def reset(self) -> None:
+        self.u_accum = None
+        self.cnt = 0
+
+    def update(self, t: int, x_start: torch.Tensor, **kwargs) -> None:
+        """
+        Args:
+            t: current timestep
+            x_start: predicted x0 tokens [N, C]
+        """
+        if self.window_steps is not None and t not in self.window_steps:
+            return
+
+        # Ensure shapes match
+        if x_start.shape != self.target_features.shape:
+            # [FIX] Use reshape instead of view_as.
+            # view() requires contiguous tensor, but target_features (sliced from LR) might be non-contiguous.
+            target = self.target_features.reshape(x_start.shape)
+        else:
+            target = self.target_features
+
+        # Initialize accumulator if needed
+        if self.u_accum is None:
+            self.u_accum = torch.zeros(x_start.shape[:-1], device=x_start.device, dtype=x_start.dtype)
+
+        # Compute Cosine Similarity
+        # dim=-1 is Channel dimension (use -1 to be safe for [N, C] or [B, L, C])
+        sim = F.cosine_similarity(x_start, target, dim=-1, eps=self.eps)
+        
+        # Uncertainty = 1 - Similarity (Range: 0 to 2)
+        uncertainty = 1.0 - sim
+        
+        self.u_accum += uncertainty
+        self.cnt += 1
+
+    def finalize(self) -> torch.Tensor:
+        if self.u_accum is None or self.cnt == 0:
+            # 如果没运行，返回全0 (假设 target_features 是 [B, L, C]，返回 [B, L])
+            return torch.zeros(self.target_features.shape[:-1], device=self.target_features.device)
+        return self.u_accum / max(self.cnt, 1)
+
 class CosineTrajectoryAccumulator:
     """
     方案4实现：基于 x0 轨迹方向一致性的置信度 (Cosine Similarity)。

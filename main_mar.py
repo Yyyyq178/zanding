@@ -60,8 +60,8 @@ def get_args_parser():
     parser.add_argument('--use_dynamic_maskgit', action='store_true',
                         help='Use dynamic MaskGIT with variance confidence (inference only)')
     parser.add_argument('--conf_method', type=str, default='stats', 
-                    choices=['entropy', 'stats', 'cosine'],
-                    help='Confidence method: entropy (Scheme 1) or stats (Scheme 2/3)')
+                    choices=['entropy', 'stats', 'cosine', 'semantic'],
+                    help='Confidence method: entropy, stats, cosine, or semantic')
     parser.add_argument('--conf_threshold', type=float, default=0.0,
                         help='Confidence threshold tau for accepting tokens')
     parser.add_argument('--conf_pmin', type=float, default=0.01,
