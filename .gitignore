@@ -31,3 +31,4 @@ CelebA-Test-400/
 logs
 *.json
 extract_images.py
+debug_log.txt

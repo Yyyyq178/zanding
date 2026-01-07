@@ -71,6 +71,8 @@ def get_args_parser():
                              '1) "Start:Step" (e.g., "40:10" -> 40,30,20,10,0); '
                              '2) "Start:End:Step" (e.g., "30:20:1" -> 30..20); '
                              '3) comma-separated list.')
+    parser.add_argument('--predictor_ckpt', type=str, default=None,
+                        help='Path to the trained confidence predictor checkpoint')
     #parser.add_argument('--label_drop_prob', default=0.1, type=float)
     parser.add_argument('--eval_freq', type=int, default=40, help='evaluation frequency')
     parser.add_argument('--save_last_freq', type=int, default=5, help='save last frequency')
@@ -417,6 +419,14 @@ def main(args):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
 
+    # [新增] 加载 Predictor
+    if args.predictor_ckpt is not None:
+        if hasattr(model, 'load_conf_predictor'):
+            model.load_conf_predictor(args.predictor_ckpt)
+        else: # 如果是 DDP 模式，model 可能是 model.module
+             if hasattr(model_without_ddp, 'load_conf_predictor'):
+                 model_without_ddp.load_conf_predictor(args.predictor_ckpt)
+                 
     # no weight decay on bias, norm layers, and diffloss MLP
     param_groups = misc.add_weight_decay(model_without_ddp, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
