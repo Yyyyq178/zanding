@@ -13,6 +13,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --img_size 512 \
     --resume output_Resume \
     --evaluate \
+    --cfg_scale 2.0 \
     --paired_test \
     --hr_data_path /root/autodl-tmp/zanding/CelebA-Test-400/HQ \
     --lr_data_path /root/autodl-tmp/zanding/CelebA-Test-400/LQ \
