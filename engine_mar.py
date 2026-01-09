@@ -298,6 +298,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
                     num_iter=args.num_iter, 
                     x_lr=x_lr,
                     temperature=args.temperature,
+                    cfg_scale=args.cfg_scale,
                 )
                 # 解码生成的 Token 变回图片
                 sampled_images = vae.decode(sampled_tokens / 0.2325)

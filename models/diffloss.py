@@ -39,10 +39,17 @@ class DiffLoss(nn.Module):
         temperature=1.0,
         confidence_accumulator=None,
         return_confidence: bool = False,
+        cfg_scale: float = 1.0,
+        z_uncond: Optional[torch.Tensor] = None,
     ):
         # diffusion loss sampling without CFG (standard forward)
-        noise = torch.randn(z.shape[0], self.in_channels).cuda()
+        noise = torch.randn(z.shape[0], self.in_channels, device=z.device)
         model_kwargs = dict(c=z)
+        if cfg_scale is not None and cfg_scale != 1.0:
+            if z_uncond is None:
+                raise ValueError("z_uncond must be provided when cfg_scale != 1.0")
+            model_kwargs["cfg_scale"] = cfg_scale
+            model_kwargs["cfg_uncond"] = z_uncond
         sample_fn = self.net.forward
 
         result = self.gen_diffusion.p_sample_loop(

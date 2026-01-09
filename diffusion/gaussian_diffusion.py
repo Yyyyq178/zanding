@@ -274,13 +274,33 @@ class GaussianDiffusion:
         if model_kwargs is None:
             model_kwargs = {}
 
+        cfg_scale = model_kwargs.pop("cfg_scale", None)
+        cfg_uncond = model_kwargs.pop("cfg_uncond", None)
+
         B, C = x.shape[:2]
         assert t.shape == (B,)
-        model_output = model(x, t, **model_kwargs)
-        if isinstance(model_output, tuple):
-            model_output, extra = model_output
+        if cfg_scale is not None and cfg_scale != 1.0:
+            if cfg_uncond is None:
+                raise ValueError("cfg_uncond must be provided when cfg_scale != 1.0")
+            cond = model_kwargs.get("c", None)
+            if cond is None:
+                raise ValueError("Conditional input 'c' must be provided for CFG.")
+            x_in = th.cat([x, x], dim=0)
+            t_in = th.cat([t, t], dim=0)
+            c_in = th.cat([cfg_uncond, cond], dim=0)
+            model_output = model(x_in, t_in, c=c_in)
+            if isinstance(model_output, tuple):
+                model_output, extra = model_output
+            else:
+                extra = None
+            model_output_uncond, model_output_cond = th.chunk(model_output, 2, dim=0)
+            model_output = model_output_uncond + cfg_scale * (model_output_cond - model_output_uncond)
         else:
-            extra = None
+            model_output = model(x, t, **model_kwargs)
+            if isinstance(model_output, tuple):
+                model_output, extra = model_output
+            else:
+                extra = None
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])

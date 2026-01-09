@@ -107,7 +107,13 @@ def get_args_parser():
     parser.add_argument('--proj_dropout', type=float, default=0.1,
                         help='projection dropout')
     parser.add_argument('--buffer_size', type=int, default=64)
-    
+    parser.add_argument('--cfg_scale', type=float, default=1.0,
+                        help='Classifier-free guidance scale for sampling')
+    parser.add_argument('--cfg_drop_prob', type=float, default=0.1,
+                        help='Condition dropout probability for CFG training')
+    parser.add_argument('--cfg_null_mode', default='zero',
+                        choices=['zero'],
+                        help='Null condition mode for CFG')
     parser.add_argument('--use_lr_inject', action='store_true',
                         help='Enable RestoreVAR-style LR injection')
     parser.add_argument('--lr_inject_layers', default='all',
@@ -392,6 +398,8 @@ def main(args):
         conf_threshold=args.conf_threshold,
         conf_pmin=args.conf_pmin,
         conf_window=args.conf_window,
+        cfg_drop_prob=args.cfg_drop_prob,
+        cfg_null_mode=args.cfg_null_mode,
     )
 
     print("Model = %s" % str(model))

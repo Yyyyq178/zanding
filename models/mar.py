@@ -404,6 +404,8 @@ class MAR(nn.Module):
                  conf_pmin: float = 0.01,
                  conf_window: str = "40:10",
                  conf_method='entropy',
+                 cfg_drop_prob: float = 0.1,
+                 cfg_null_mode: str = "zero",
                  ):
         super().__init__()
 
@@ -428,6 +430,8 @@ class MAR(nn.Module):
         self.conf_pmin = conf_pmin
         self.conf_window = conf_window
         self.conf_method = conf_method
+        self.cfg_drop_prob = cfg_drop_prob
+        self.cfg_null_mode = cfg_null_mode
         self.remask_mode = "mask_token"
         self.conf_stats_path = None
         self._conf_stats_cache = None
@@ -530,25 +534,6 @@ class MAR(nn.Module):
                     torch.zeros(1, lr_seq_len, decoder_embed_dim)
                 )
         self._lr_inject_rope_logged = False
-        self.discriminator = None
-        if self.conf_method == 'discriminator':
-            # 假设你会在 main_mar.py 里设置 model.discriminator_ckpt
-            self.discriminator_ckpt = "output_discriminator/discriminator_final.pth" 
-            self._load_discriminator()
-
-    def _load_discriminator(self):
-        if not os.path.exists(self.discriminator_ckpt):
-            print(f"Warning: Discriminator checkpoint not found at {self.discriminator_ckpt}")
-            return
-        
-        from models.discriminator import UNetDiscriminatorSN
-        self.discriminator = UNetDiscriminatorSN(num_in_ch=6).cuda().eval()
-        # 加载权重
-        state_dict = torch.load(self.discriminator_ckpt, map_location='cuda')
-        self.discriminator.load_state_dict(state_dict)
-        for p in self.discriminator.parameters():
-            p.requires_grad = False
-        print(f"Loaded Discriminator from {self.discriminator_ckpt}")
 
     def load_conf_predictor(self, ckpt_path):
         print(f"Loading Difficulty Predictor from {ckpt_path}...")
@@ -620,7 +605,26 @@ class MAR(nn.Module):
             else:
                 raise ValueError(f"Unsupported lr_inject_cond_source: {self.lr_inject_cond_source}")
         return cond_tokens
+    
+    def _build_lr_cond_tokens(self, x_lr, lr_tokens):
+        cond_tokens_encoder = None
+        cond_tokens_decoder = None
+        if self.use_lr_inject:
+            cond_tokens_base = self._build_lr_inject_cond_tokens(x_lr, lr_tokens=lr_tokens)
+            cond_tokens_encoder = self.lr_inject_cond_proj_encoder(cond_tokens_base)
+            cond_tokens_decoder = self.lr_inject_cond_proj_decoder(cond_tokens_base)
+            if not self.use_rope:
+                lr_pos_enc = self.lr_pos_embed_encoder[:, : cond_tokens_encoder.shape[1], :]
+                lr_pos_dec = self.lr_pos_embed_decoder[:, : cond_tokens_decoder.shape[1], :]
+                cond_tokens_encoder = cond_tokens_encoder + lr_pos_enc
+                cond_tokens_decoder = cond_tokens_decoder + lr_pos_dec
+        return cond_tokens_encoder, cond_tokens_decoder
 
+    def _build_null_condition(self, x_lr, lr_tokens):
+        if self.cfg_null_mode == "zero":
+            return torch.zeros_like(x_lr), torch.zeros_like(lr_tokens)
+        raise ValueError(f"Unsupported cfg_null_mode: {self.cfg_null_mode}")
+    
     def get_lr_inject_gate_mean(self) -> float:
         if not self.use_lr_inject:
             return 0.0
@@ -957,6 +961,11 @@ class MAR(nn.Module):
         shape_hr = (self.seq_h, self.seq_w)
         shape_lr = (self.seq_h, self.seq_w)
 
+        if self.training and self.cfg_drop_prob > 0:
+            drop_mask = torch.rand(x_lr.shape[0], device=x_lr.device) < self.cfg_drop_prob
+            if drop_mask.any():
+                x_lr = x_lr.clone()
+                x_lr[drop_mask] = 0
         # patchify and mask (drop) tokens
         lr_tokens = self.patchify(x_lr)
         hr_tokens = self.patchify(x_hr)
@@ -968,17 +977,7 @@ class MAR(nn.Module):
         # 生成随机掩码
         orders = self.sample_orders(bsz=hr_tokens.size(0), num_tokens = num_tokens)
         mask = self.random_masking(hr_tokens, orders)
-        cond_tokens_encoder = None
-        cond_tokens_decoder = None
-        if self.use_lr_inject:
-            cond_tokens_base = self._build_lr_inject_cond_tokens(x_lr, lr_tokens=lr_tokens)
-            cond_tokens_encoder = self.lr_inject_cond_proj_encoder(cond_tokens_base)
-            cond_tokens_decoder = self.lr_inject_cond_proj_decoder(cond_tokens_base)
-            if not self.use_rope:
-                lr_pos_enc = self.lr_pos_embed_encoder[:, : cond_tokens_encoder.shape[1], :]
-                lr_pos_dec = self.lr_pos_embed_decoder[:, : cond_tokens_decoder.shape[1], :]
-                cond_tokens_encoder = cond_tokens_encoder + lr_pos_enc
-                cond_tokens_decoder = cond_tokens_decoder + lr_pos_dec
+        cond_tokens_encoder, cond_tokens_decoder = self._build_lr_cond_tokens(x_lr, lr_tokens)
 
         # mae encoder
         x = self.forward_mae_encoder(
@@ -1000,10 +999,11 @@ class MAR(nn.Module):
 
     def sample_tokens(self, bsz, num_iter=64, x_lr=None,
                       temperature=1.0, progress=False,
-                      gate_multiplier=1.0):
+                      gate_multiplier=1.0,
+                      cfg_scale: float = 1.0):
         if x_lr is None:
             raise ValueError("Super-Resolution requires LR input!")
-        
+        use_cfg = cfg_scale is not None and cfg_scale > 1.0
         # 1. 基础参数与 Embedding 准备
         shape_lr = (self.seq_h, self.seq_w)
         shape_hr = (self.seq_h, self.seq_w)
@@ -1011,152 +1011,91 @@ class MAR(nn.Module):
         self._maybe_log_lr_inject_rope(num_hr_tokens, shape_hr)
         
         lr_tokens = self.patchify(x_lr)
-        cond_tokens_encoder = None
-        cond_tokens_decoder = None
-        if self.use_lr_inject:
-            cond_tokens_base = self._build_lr_inject_cond_tokens(x_lr, lr_tokens=lr_tokens)
-            cond_tokens_encoder = self.lr_inject_cond_proj_encoder(cond_tokens_base)
-            cond_tokens_decoder = self.lr_inject_cond_proj_decoder(cond_tokens_base)
-            if not self.use_rope:
-                lr_pos_enc = self.lr_pos_embed_encoder[:, : cond_tokens_encoder.shape[1], :]
-                lr_pos_dec = self.lr_pos_embed_decoder[:, : cond_tokens_decoder.shape[1], :]
-                cond_tokens_encoder = cond_tokens_encoder + lr_pos_enc
-                cond_tokens_decoder = cond_tokens_decoder + lr_pos_dec
+        cond_tokens_encoder, cond_tokens_decoder = self._build_lr_cond_tokens(x_lr, lr_tokens)
+        lr_tokens_uncond = None
+        cond_tokens_encoder_uncond = None
+        cond_tokens_decoder_uncond = None
+        if use_cfg:
+            x_lr_uncond, lr_tokens_uncond = self._build_null_condition(x_lr, lr_tokens)
+            cond_tokens_encoder_uncond, cond_tokens_decoder_uncond = self._build_lr_cond_tokens(
+                x_lr_uncond, lr_tokens_uncond
+            )
 
         device = x_lr.device 
         mask = torch.ones(bsz, num_hr_tokens, device=device)
         tokens = torch.zeros(bsz, num_hr_tokens, self.token_embed_dim, device=device)
         actual_steps = num_iter
-        
-        # =========================================================
-        # [分支 A] Discriminator Mode (Draft & Refine 策略)
-        # =========================================================
-        if self.conf_method == 'discriminator':
-            # --- Phase 1: Draft (快速出草稿) ---
-            # 设定草稿步数 (例如 60%)
-            draft_ratio = 0.6
-            draft_steps = max(1, int(num_iter * draft_ratio))
-            
-            orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
-            
-            # Draft Loop (标准 MaskGIT 流程，但步数较少)
-            for step in range(draft_steps):
-                cur_tokens = tokens.clone()
-                x = self.forward_mae_encoder(tokens, mask, lr_tokens, shape_hr, shape_lr, cond_tokens=cond_tokens_encoder, gate_multiplier=gate_multiplier)
-                z, pos_embed, _ = self.forward_mae_decoder(x, mask, shape_hr, shape_lr, cond_tokens=cond_tokens_decoder, gate_multiplier=gate_multiplier, return_entropy=False)
-                
-                # Mask Schedule (适配 draft_steps)
-                mask_ratio = np.cos(math.pi / 2. * (step + 1) / draft_steps)
-                mask_len = torch.floor(torch.full((1,), num_hr_tokens * mask_ratio, device=device))
-                mask_len = torch.maximum(torch.tensor(1., device=device), torch.minimum(mask.sum(dim=-1, keepdim=True) - 1, mask_len))
-                
-                # Update Mask
-                mask_next = mask_by_order(mask_len[0], orders, bsz, num_hr_tokens)
-                mask_to_pred = torch.logical_xor(mask.bool(), mask_next.bool())
-                
-                indices_to_pred = mask_to_pred.nonzero(as_tuple=True)
-                if len(indices_to_pred[0]) > 0:
-                    z_cond = z[indices_to_pred] + pos_embed[indices_to_pred]
-                    sampled = self.diffloss.sample(z_cond, temperature)
-                    cur_tokens[indices_to_pred] = sampled
-                
-                tokens = cur_tokens
-                mask = mask_next
-            
-            # Draft 完成，得到 sr_draft (此时 mask 基本全0)
-            sr_draft = self.unpatchify(tokens, shape=shape_hr)
 
-            # --- Phase 2: Judge (判别器介入) ---
-            # 只有加载了判别器才进行 Refine
-            if getattr(self, 'discriminator', None) is not None:
-                with torch.no_grad():
-                    # 拼接 [SR, LR] -> 输入判别器
-                    d_input = torch.cat([sr_draft, x_lr], dim=1) 
-                    logits = self.discriminator(d_input)
-                    realness = torch.sigmoid(logits) # 1=Good, 0=Bad
-                
-                # 计算全图质量 (Early Exit Check)
-                min_score = realness.view(bsz, -1).min(dim=1).values
-                if (min_score > 0.8).all():
-                    if is_main_process():
-                        print(f"[Discriminator] Early exit at {draft_steps} steps (High Quality).")
-                    return sr_draft, draft_steps
-                
-                # --- Phase 3: Refine Mask Generation ---
-                # 找出最差的 30% 区域
-                token_quality = F.interpolate(realness, size=shape_hr, mode='area')
-                token_quality = token_quality.flatten(2).squeeze(1) # [B, N]
-                k = int(num_hr_tokens * 0.3)
-                _, worst_indices = torch.topk(token_quality, k=k, largest=False)
-                
-                # 重置 Mask：坏的地方设为 1，好的地方设为 0
-                mask.fill_(0)
-                mask.scatter_(1, worst_indices, 1) 
-                
-                # --- Phase 4: Refine Loop ---
-                refine_steps = num_iter - draft_steps
-                
-                # Refine 循环 (针对 Mask 区域进行重绘)
-                # 注意：我们使用随机顺序来逐步揭开这些 Mask
-                refine_orders = self.sample_orders(bsz, num_tokens=num_hr_tokens) # 新的随机顺序
-                
-                # 初始需要 Refine 的总数
-                total_refine_tokens = mask.sum(dim=-1, keepdim=True) # 应该是 k
+        def run_transformer(tokens_in, mask_in, lr_tokens_cond, lr_tokens_uncond,
+                            cond_enc_cond, cond_enc_uncond, cond_dec_cond, cond_dec_uncond,
+                            gate_mul, return_entropy: bool = False):
+            if not use_cfg:
+                x = self.forward_mae_encoder(
+                    tokens_in, mask_in, lr_tokens_cond, shape_hr, shape_lr,
+                    cond_tokens=cond_enc_cond, gate_multiplier=gate_mul
+                )
+                if return_entropy:
+                    z, pos_embed, entropy = self.forward_mae_decoder(
+                        x, mask_in, shape_hr, shape_lr,
+                        cond_tokens=cond_dec_cond, gate_multiplier=gate_mul, return_entropy=True
+                    )
+                else:
+                    z, pos_embed = self.forward_mae_decoder(
+                        x, mask_in, shape_hr, shape_lr,
+                        cond_tokens=cond_dec_cond, gate_multiplier=gate_mul
+                    )
+                    entropy = None
+                return z, pos_embed, None, entropy
 
-                for step in range(refine_steps):
-                    cur_tokens = tokens.clone()
-                    x = self.forward_mae_encoder(tokens, mask, lr_tokens, shape_hr, shape_lr, cond_tokens=cond_tokens_encoder, gate_multiplier=gate_multiplier)
-                    z, pos_embed, _ = self.forward_mae_decoder(x, mask, shape_hr, shape_lr, cond_tokens=cond_tokens_decoder, gate_multiplier=gate_multiplier)
-                    
-                    # Refine Schedule: 从 k 减少到 0
-                    ratio = np.cos(math.pi / 2. * (step + 1) / refine_steps)
-                    num_keep = torch.floor(total_refine_tokens * ratio)
-                    
-                    # 确定哪些位置继续保持 Mask (1)                    
-                    # 找出当前 mask 为 1 的索引
-                    current_mask_indices = mask.nonzero(as_tuple=True) # (b_idx, t_idx)
-                    
-                    # 采样
-                    mask_to_pred = mask.bool() # 当前所有 mask 区域都预测
-                    indices_to_pred = mask_to_pred.nonzero(as_tuple=True)
-                    if len(indices_to_pred[0]) > 0:
-                        z_cond = z[indices_to_pred] + pos_embed[indices_to_pred]
-                        sampled = self.diffloss.sample(z_cond, temperature)
-                        cur_tokens[indices_to_pred] = sampled
-                        tokens = cur_tokens
-                    
-                    # 更新 Mask (减少 mask 数量)
-                    mask_next = torch.zeros_like(mask)
-                    if step < refine_steps - 1:
-                        # 这是一个简化的 mask update，实际可以用更复杂的
-                        # 对每个样本，保留 num_keep 个 1
-                        for i in range(bsz):
-                            n_k = int(num_keep[i].item())
-                            if n_k > 0:
-                                # 获取当前样本中 mask=1 的位置
-                                valid_indices = (mask[i] == 1).nonzero(as_tuple=True)[0]
-                                # 随机选 n_k 个保留
-                                keep_perm = torch.randperm(len(valid_indices))[:n_k]
-                                keep_indices = valid_indices[keep_perm]
-                                mask_next[i, keep_indices] = 1.0
-                    
-                    mask = mask_next
+            tokens_cat = torch.cat([tokens_in, tokens_in], dim=0)
+            mask_cat = torch.cat([mask_in, mask_in], dim=0)
+            lr_tokens_cat = torch.cat([lr_tokens_uncond, lr_tokens_cond], dim=0)
+            cond_enc_cat = None
+            cond_dec_cat = None
+            if cond_enc_cond is not None:
+                cond_enc_cat = torch.cat([cond_enc_uncond, cond_enc_cond], dim=0)
+            if cond_dec_cond is not None:
+                cond_dec_cat = torch.cat([cond_dec_uncond, cond_dec_cond], dim=0)
+            gate_mul_cat = gate_mul
+            if torch.is_tensor(gate_mul) and gate_mul.shape[0] == tokens_in.shape[0]:
+                gate_mul_cat = torch.cat([gate_mul, gate_mul], dim=0)
 
-            actual_steps = num_iter
-            return self.unpatchify(tokens, shape=shape_hr), actual_steps
+            x = self.forward_mae_encoder(
+                tokens_cat, mask_cat, lr_tokens_cat, shape_hr, shape_lr,
+                cond_tokens=cond_enc_cat, gate_multiplier=gate_mul_cat
+            )
+            if return_entropy:
+                z_cat, pos_embed_cat, entropy_cat = self.forward_mae_decoder(
+                    x, mask_cat, shape_hr, shape_lr,
+                    cond_tokens=cond_dec_cat, gate_multiplier=gate_mul_cat, return_entropy=True
+                )
+                entropy = entropy_cat.chunk(2, dim=0)[1]
+            else:
+                z_cat, pos_embed_cat = self.forward_mae_decoder(
+                    x, mask_cat, shape_hr, shape_lr,
+                    cond_tokens=cond_dec_cat, gate_multiplier=gate_mul_cat
+                )
+                entropy = None
 
+            z_uncond, z_cond = z_cat.chunk(2, dim=0)
+            pos_uncond, pos_cond = pos_embed_cat.chunk(2, dim=0)
+            return z_cond, pos_cond, z_uncond, entropy
         # =========================================================
-        # [分支 B] 静态 MaskGIT (保持原样)
+        # [分支 A] 静态 MaskGIT 
         # =========================================================
-        elif not self.use_dynamic_maskgit:
+        if not self.use_dynamic_maskgit:
             orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
             indices = list(range(num_iter))
             if progress: indices = tqdm(indices)
             prev_mask_len = None
             for step in indices:
                 cur_tokens = tokens.clone()
-                x = self.forward_mae_encoder(tokens, mask, lr_tokens, shape_hr, shape_lr, cond_tokens=cond_tokens_encoder, gate_multiplier=gate_multiplier)
-                z, pos_embed = self.forward_mae_decoder(x, mask, shape_hr, shape_lr, cond_tokens=cond_tokens_decoder, gate_multiplier=gate_multiplier)
+                z, pos_embed, z_uncond, _ = run_transformer(
+                        tokens, mask, lr_tokens, lr_tokens_uncond,
+                        cond_tokens_encoder, cond_tokens_encoder_uncond,
+                        cond_tokens_decoder, cond_tokens_decoder_uncond,
+                        gate_multiplier, return_entropy=False
+                    )
                 mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
                 mask_len = torch.Tensor([np.floor(num_hr_tokens * mask_ratio)]).cuda()
                 mask_len = torch.maximum(torch.Tensor([1]).cuda(), torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len))
@@ -1171,14 +1110,17 @@ class MAR(nn.Module):
                 mask = mask_next
                 indices_to_pred = mask_to_pred.nonzero(as_tuple=True)
                 z_cond = z[indices_to_pred] + pos_embed[indices_to_pred]
-                sampled_token_latent = self.diffloss.sample(z_cond, temperature)
+                z_cond_uncond = z_uncond[indices_to_pred] + pos_embed[indices_to_pred] if use_cfg else None
+                sampled_token_latent = self.diffloss.sample(
+                            z_cond, temperature, cfg_scale=cfg_scale, z_uncond=z_cond_uncond
+                        )
                 cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
                 tokens = cur_tokens.clone()
             
             return self.unpatchify(tokens, shape=shape_hr), actual_steps
 
         # =========================================================
-        # [分支 C] 动态 MaskGIT (Predictor/Entropy/Stats)
+        # [分支 B] 动态 MaskGIT (Predictor/Entropy/Stats)
         # =========================================================
         else:
             # 1. 判定当前使用的模式
@@ -1258,23 +1200,38 @@ class MAR(nn.Module):
                 
                 cond_enc_active = cond_tokens_encoder[active_indices] if cond_tokens_encoder is not None else None
                 cond_dec_active = cond_tokens_decoder[active_indices] if cond_tokens_decoder is not None else None
+                lr_tokens_uncond_active = lr_tokens_uncond[active_indices] if use_cfg else None
+                cond_enc_uncond_active = cond_tokens_encoder_uncond[active_indices] if cond_tokens_encoder_uncond is not None else None
+                cond_dec_uncond_active = cond_tokens_decoder_uncond[active_indices] if cond_tokens_decoder_uncond is not None else None
                 gate_mul_active = gate_multiplier[active_indices] if (torch.is_tensor(gate_multiplier) and gate_multiplier.shape[0] == bsz) else gate_multiplier
 
                 # 1. Forward Pass
                 z_list, pos_embed_list, entropy_list = [], [], []
+                z_uncond_list = []
                 for i in range(curr_bsz_active):
                     t_i, m_i, l_i = tokens_active[i:i+1], mask_active[i:i+1], lr_tokens_active[i:i+1]
                     c_enc_i = cond_enc_active[i:i+1] if cond_enc_active is not None else None
                     c_dec_i = cond_dec_active[i:i+1] if cond_dec_active is not None else None
+                    l_uncond_i = lr_tokens_uncond_active[i:i+1] if use_cfg else None
+                    c_enc_uncond_i = cond_enc_uncond_active[i:i+1] if cond_enc_uncond_active is not None else None
+                    c_dec_uncond_i = cond_dec_uncond_active[i:i+1] if cond_dec_uncond_active is not None else None
                     g_mul_i = gate_mul_active[i:i+1] if torch.is_tensor(gate_mul_active) else gate_mul_active
 
-                    x_i = self.forward_mae_encoder(t_i, m_i, l_i, shape_hr, shape_lr, cond_tokens=c_enc_i, gate_multiplier=g_mul_i)
-                    z_i, pos_i, ent_i = self.forward_mae_decoder(x_i, m_i, shape_hr, shape_lr, cond_tokens=c_dec_i, gate_multiplier=g_mul_i, return_entropy=use_entropy)
-                    z_list.append(z_i); pos_embed_list.append(pos_i)
+                    z_i, pos_i, z_uncond_i, ent_i = run_transformer(
+                        t_i, m_i, l_i, l_uncond_i,
+                        c_enc_i, c_enc_uncond_i,
+                        c_dec_i, c_dec_uncond_i,
+                        g_mul_i, return_entropy=use_entropy
+                    )
+                    z_list.append(z_i)
+                    pos_embed_list.append(pos_i)
+                    if use_cfg:
+                        z_uncond_list.append(z_uncond_i)
                     if use_entropy: entropy_list.append(ent_i)
                 
                 z_active = torch.cat(z_list, dim=0)
                 pos_embed_active = torch.cat(pos_embed_list, dim=0)
+                z_uncond_active = torch.cat(z_uncond_list, dim=0) if use_cfg else None
                 entropy_active = torch.cat(entropy_list, dim=0) if use_entropy else None
 
                 mask_to_pred_active = mask_active.bool()
@@ -1285,7 +1242,10 @@ class MAR(nn.Module):
                     continue
 
                 z_cond_active = z_active[indices_to_pred_active] + pos_embed_active[indices_to_pred_active]
-
+                z_uncond_active = (
+                    z_uncond_active[indices_to_pred_active] + pos_embed_active[indices_to_pred_active]
+                    if use_cfg else None
+                )
                 # 2. 采样与置信度计算
                 u_map = None
                 sampled_token_latent = None
@@ -1293,8 +1253,10 @@ class MAR(nn.Module):
                 if use_learned_conf:
                     # === [模式 1] Learned Predictor (CNN) ===
                     # 1. 正常采样当前步的 Token
-                    sampled_token_latent = self.diffloss.sample(z_cond_active, temperature, return_confidence=False)
-                    
+                    sampled_token_latent = self.diffloss.sample(
+                        z_cond_active, temperature, return_confidence=False,
+                        cfg_scale=cfg_scale, z_uncond=z_uncond_active
+                    )                    
                     # 2. 准备 Predictor 的输入 (只需要 LR)
                     # lr_tokens_active 是 patch 后的 [B_active, L, D] -> 变回 [B_active, D, H, W]
                     lr_map = self.unpatchify(lr_tokens_active, shape=shape_lr)
@@ -1313,7 +1275,10 @@ class MAR(nn.Module):
 
                 elif use_entropy:
                     # === [模式 2] Entropy ===
-                    sampled_token_latent = self.diffloss.sample(z_cond_active, temperature, return_confidence=False)
+                    sampled_token_latent = self.diffloss.sample(
+                        z_cond_active, temperature, return_confidence=False,
+                        cfg_scale=cfg_scale, z_uncond=z_uncond_active
+                    )
                     u_map = entropy_active[indices_to_pred_active]
 
                 else:
@@ -1339,7 +1304,8 @@ class MAR(nn.Module):
                         conf_acc = VarianceConfidenceAccumulator(window_steps)
                     
                     sampled_token_latent, u_map_raw = self.diffloss.sample(
-                        z_cond_active, temperature, confidence_accumulator=conf_acc, return_confidence=True
+                        z_cond_active, temperature, confidence_accumulator=conf_acc, return_confidence=True,
+                        cfg_scale=cfg_scale, z_uncond=z_uncond_active
                     )
                     
                     # 标准化处理
