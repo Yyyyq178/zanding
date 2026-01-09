@@ -986,7 +986,7 @@ class MAR(nn.Module):
             gate_multiplier=gate_multiplier
         )
         # mae decoder
-        z, pos_embed  = self.forward_mae_decoder(
+        z, pos_embed, _  = self.forward_mae_decoder(
             x, mask, shape_hr, shape_lr,
             cond_tokens=cond_tokens_decoder,
             gate_multiplier=gate_multiplier
@@ -1040,7 +1040,7 @@ class MAR(nn.Module):
                         cond_tokens=cond_dec_cond, gate_multiplier=gate_mul, return_entropy=True
                     )
                 else:
-                    z, pos_embed = self.forward_mae_decoder(
+                    z, pos_embed, _ = self.forward_mae_decoder(
                         x, mask_in, shape_hr, shape_lr,
                         cond_tokens=cond_dec_cond, gate_multiplier=gate_mul
                     )
@@ -1071,7 +1071,7 @@ class MAR(nn.Module):
                 )
                 entropy = entropy_cat.chunk(2, dim=0)[1]
             else:
-                z_cat, pos_embed_cat = self.forward_mae_decoder(
+                z_cat, pos_embed_cat, _ = self.forward_mae_decoder(
                     x, mask_cat, shape_hr, shape_lr,
                     cond_tokens=cond_dec_cat, gate_multiplier=gate_mul_cat
                 )
