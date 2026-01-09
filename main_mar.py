@@ -441,7 +441,15 @@ def main(args):
             print(f"Checkpoint loaded with missing keys: {missing} and unexpected keys: {unexpected}")
         model_params = list(model_without_ddp.parameters())
         ema_state_dict = checkpoint['model_ema']
-        ema_params = [ema_state_dict[name].cuda() for name, _ in model_without_ddp.named_parameters()]
+        ema_params = []
+        for name, p in model_without_ddp.named_parameters():
+            if name in ema_state_dict:
+                ema_params.append(ema_state_dict[name].cuda())
+            else:
+                # 这种情况通常发生在加入了新的 Predictor 参数，但 Checkpoint 是旧的时候
+                # 直接使用当前的参数（即刚刚加载的 Predictor 权重）作为 EMA 的初始值
+                ema_params.append(p.data.clone())
+        # ema_params = [ema_state_dict[name].cuda() for name, _ in model_without_ddp.named_parameters()]
         print("Resume checkpoint %s" % args.resume)
 
         if 'optimizer' in checkpoint and 'epoch' in checkpoint and not args.evaluate:

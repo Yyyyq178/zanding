@@ -19,9 +19,10 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --use_lr_inject \
     --use_rope \
     --use_dynamic_maskgit \
-    --conf_method semantic \
-    --conf_threshold 0.3 \
+    --conf_threshold 0.6 \
     --conf_pmin 0.05 \
     --use_mse_loss \
-    --conf_window '100:0:10' \
-    --output_dir Evaluate_Resume_semantic_0.3_0.05_100:0_10_16_0.1-0.6
+    --predictor_ckpt output_predictor/predictor_latest.pth \
+    --output_dir Evaluate_Resume_predictor-new_0.5_0.05_16_0.5-0.8
+    # --conf_method semantic \
+    # --conf_window '100:0:10' \

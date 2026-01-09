@@ -9,5 +9,5 @@ python train_predictor.py \
     --vae_path pretrained_models/vae/kl16.ckpt \
     --output_dir output_predictor \
     --img_size 512 \
-    --epochs 10 \
-    --batch_size 32
+    --epochs 150 \
+    --batch_size 8

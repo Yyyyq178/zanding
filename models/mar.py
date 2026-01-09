@@ -4,6 +4,7 @@ import numpy as np
 from tqdm import tqdm
 import scipy.stats as stats
 import math
+import os
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
@@ -354,21 +355,26 @@ def mask_by_order(mask_len, order, bsz, seq_len):
     masking = torch.scatter(masking, dim=-1, index=order[:, :mask_len.long()], src=torch.ones(bsz, seq_len).cuda()).bool()
     return masking
 
-class LatentConfidencePredictor(nn.Module):
+class DifficultyPredictor(nn.Module):
     def __init__(self, in_channels=16, hidden_dim=64):
         super().__init__()
+        # 注意：这里和训练代码保持一致
         self.net = nn.Sequential(
-            nn.Conv2d(in_channels * 2, hidden_dim, 3, 1, 1),
+            nn.Conv2d(in_channels, hidden_dim, 3, 1, 1), # 输入只有 LR (16通道)
+            nn.GroupNorm(8, hidden_dim),
+            nn.SiLU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, 1, 1),
             nn.GroupNorm(8, hidden_dim),
             nn.SiLU(),
             nn.Conv2d(hidden_dim, hidden_dim, 3, 1, 1),
             nn.GroupNorm(8, hidden_dim),
             nn.SiLU(),
             nn.Conv2d(hidden_dim, 1, 1),
-            nn.Sigmoid()
+            nn.ReLU() # 输出误差 >= 0
         )
-    def forward(self, sr, lr):
-        return self.net(torch.cat([sr, lr], dim=1))
+
+    def forward(self, lr_latent):
+        return self.net(lr_latent)
     
 class MAR(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
@@ -524,11 +530,30 @@ class MAR(nn.Module):
                     torch.zeros(1, lr_seq_len, decoder_embed_dim)
                 )
         self._lr_inject_rope_logged = False
+        self.discriminator = None
+        if self.conf_method == 'discriminator':
+            # 假设你会在 main_mar.py 里设置 model.discriminator_ckpt
+            self.discriminator_ckpt = "output_discriminator/discriminator_final.pth" 
+            self._load_discriminator()
+
+    def _load_discriminator(self):
+        if not os.path.exists(self.discriminator_ckpt):
+            print(f"Warning: Discriminator checkpoint not found at {self.discriminator_ckpt}")
+            return
+        
+        from models.discriminator import UNetDiscriminatorSN
+        self.discriminator = UNetDiscriminatorSN(num_in_ch=6).cuda().eval()
+        # 加载权重
+        state_dict = torch.load(self.discriminator_ckpt, map_location='cuda')
+        self.discriminator.load_state_dict(state_dict)
+        for p in self.discriminator.parameters():
+            p.requires_grad = False
+        print(f"Loaded Discriminator from {self.discriminator_ckpt}")
 
     def load_conf_predictor(self, ckpt_path):
-        print(f"Loading Confidence Predictor from {ckpt_path}...")
-        self.conf_predictor = LatentConfidencePredictor(in_channels=self.vae_embed_dim)
-        # 加载权重
+        print(f"Loading Difficulty Predictor from {ckpt_path}...")
+        # [修改] 使用新的类
+        self.conf_predictor = DifficultyPredictor(in_channels=self.vae_embed_dim)
         state = torch.load(ckpt_path, map_location='cpu')
         self.conf_predictor.load_state_dict(state)
         self.conf_predictor.eval() 
@@ -1003,9 +1028,127 @@ class MAR(nn.Module):
         tokens = torch.zeros(bsz, num_hr_tokens, self.token_embed_dim, device=device)
         actual_steps = num_iter
         
-        # === 分支 A: 静态 MaskGIT (保持原样) ===
-        if not self.use_dynamic_maskgit:
-            # ... (静态 MaskGIT 代码省略，保持不变) ...
+        # =========================================================
+        # [分支 A] Discriminator Mode (Draft & Refine 策略)
+        # =========================================================
+        if self.conf_method == 'discriminator':
+            # --- Phase 1: Draft (快速出草稿) ---
+            # 设定草稿步数 (例如 60%)
+            draft_ratio = 0.6
+            draft_steps = max(1, int(num_iter * draft_ratio))
+            
+            orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
+            
+            # Draft Loop (标准 MaskGIT 流程，但步数较少)
+            for step in range(draft_steps):
+                cur_tokens = tokens.clone()
+                x = self.forward_mae_encoder(tokens, mask, lr_tokens, shape_hr, shape_lr, cond_tokens=cond_tokens_encoder, gate_multiplier=gate_multiplier)
+                z, pos_embed, _ = self.forward_mae_decoder(x, mask, shape_hr, shape_lr, cond_tokens=cond_tokens_decoder, gate_multiplier=gate_multiplier, return_entropy=False)
+                
+                # Mask Schedule (适配 draft_steps)
+                mask_ratio = np.cos(math.pi / 2. * (step + 1) / draft_steps)
+                mask_len = torch.floor(torch.full((1,), num_hr_tokens * mask_ratio, device=device))
+                mask_len = torch.maximum(torch.tensor(1., device=device), torch.minimum(mask.sum(dim=-1, keepdim=True) - 1, mask_len))
+                
+                # Update Mask
+                mask_next = mask_by_order(mask_len[0], orders, bsz, num_hr_tokens)
+                mask_to_pred = torch.logical_xor(mask.bool(), mask_next.bool())
+                
+                indices_to_pred = mask_to_pred.nonzero(as_tuple=True)
+                if len(indices_to_pred[0]) > 0:
+                    z_cond = z[indices_to_pred] + pos_embed[indices_to_pred]
+                    sampled = self.diffloss.sample(z_cond, temperature)
+                    cur_tokens[indices_to_pred] = sampled
+                
+                tokens = cur_tokens
+                mask = mask_next
+            
+            # Draft 完成，得到 sr_draft (此时 mask 基本全0)
+            sr_draft = self.unpatchify(tokens, shape=shape_hr)
+
+            # --- Phase 2: Judge (判别器介入) ---
+            # 只有加载了判别器才进行 Refine
+            if getattr(self, 'discriminator', None) is not None:
+                with torch.no_grad():
+                    # 拼接 [SR, LR] -> 输入判别器
+                    d_input = torch.cat([sr_draft, x_lr], dim=1) 
+                    logits = self.discriminator(d_input)
+                    realness = torch.sigmoid(logits) # 1=Good, 0=Bad
+                
+                # 计算全图质量 (Early Exit Check)
+                min_score = realness.view(bsz, -1).min(dim=1).values
+                if (min_score > 0.8).all():
+                    if is_main_process():
+                        print(f"[Discriminator] Early exit at {draft_steps} steps (High Quality).")
+                    return sr_draft, draft_steps
+                
+                # --- Phase 3: Refine Mask Generation ---
+                # 找出最差的 30% 区域
+                token_quality = F.interpolate(realness, size=shape_hr, mode='area')
+                token_quality = token_quality.flatten(2).squeeze(1) # [B, N]
+                k = int(num_hr_tokens * 0.3)
+                _, worst_indices = torch.topk(token_quality, k=k, largest=False)
+                
+                # 重置 Mask：坏的地方设为 1，好的地方设为 0
+                mask.fill_(0)
+                mask.scatter_(1, worst_indices, 1) 
+                
+                # --- Phase 4: Refine Loop ---
+                refine_steps = num_iter - draft_steps
+                
+                # Refine 循环 (针对 Mask 区域进行重绘)
+                # 注意：我们使用随机顺序来逐步揭开这些 Mask
+                refine_orders = self.sample_orders(bsz, num_tokens=num_hr_tokens) # 新的随机顺序
+                
+                # 初始需要 Refine 的总数
+                total_refine_tokens = mask.sum(dim=-1, keepdim=True) # 应该是 k
+
+                for step in range(refine_steps):
+                    cur_tokens = tokens.clone()
+                    x = self.forward_mae_encoder(tokens, mask, lr_tokens, shape_hr, shape_lr, cond_tokens=cond_tokens_encoder, gate_multiplier=gate_multiplier)
+                    z, pos_embed, _ = self.forward_mae_decoder(x, mask, shape_hr, shape_lr, cond_tokens=cond_tokens_decoder, gate_multiplier=gate_multiplier)
+                    
+                    # Refine Schedule: 从 k 减少到 0
+                    ratio = np.cos(math.pi / 2. * (step + 1) / refine_steps)
+                    num_keep = torch.floor(total_refine_tokens * ratio)
+                    
+                    # 确定哪些位置继续保持 Mask (1)                    
+                    # 找出当前 mask 为 1 的索引
+                    current_mask_indices = mask.nonzero(as_tuple=True) # (b_idx, t_idx)
+                    
+                    # 采样
+                    mask_to_pred = mask.bool() # 当前所有 mask 区域都预测
+                    indices_to_pred = mask_to_pred.nonzero(as_tuple=True)
+                    if len(indices_to_pred[0]) > 0:
+                        z_cond = z[indices_to_pred] + pos_embed[indices_to_pred]
+                        sampled = self.diffloss.sample(z_cond, temperature)
+                        cur_tokens[indices_to_pred] = sampled
+                        tokens = cur_tokens
+                    
+                    # 更新 Mask (减少 mask 数量)
+                    mask_next = torch.zeros_like(mask)
+                    if step < refine_steps - 1:
+                        # 这是一个简化的 mask update，实际可以用更复杂的
+                        # 对每个样本，保留 num_keep 个 1
+                        for i in range(bsz):
+                            n_k = int(num_keep[i].item())
+                            if n_k > 0:
+                                # 获取当前样本中 mask=1 的位置
+                                valid_indices = (mask[i] == 1).nonzero(as_tuple=True)[0]
+                                # 随机选 n_k 个保留
+                                keep_perm = torch.randperm(len(valid_indices))[:n_k]
+                                keep_indices = valid_indices[keep_perm]
+                                mask_next[i, keep_indices] = 1.0
+                    
+                    mask = mask_next
+
+            actual_steps = num_iter
+            return self.unpatchify(tokens, shape=shape_hr), actual_steps
+
+        # =========================================================
+        # [分支 B] 静态 MaskGIT (保持原样)
+        # =========================================================
+        elif not self.use_dynamic_maskgit:
             orders = self.sample_orders(bsz, num_tokens=num_hr_tokens)
             indices = list(range(num_iter))
             if progress: indices = tqdm(indices)
@@ -1031,19 +1174,28 @@ class MAR(nn.Module):
                 sampled_token_latent = self.diffloss.sample(z_cond, temperature)
                 cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
                 tokens = cur_tokens.clone()
+            
+            return self.unpatchify(tokens, shape=shape_hr), actual_steps
 
-        # === 分支 B: 动态 MaskGIT (Predictor + Remask) ===
+        # =========================================================
+        # [分支 C] 动态 MaskGIT (Predictor/Entropy/Stats)
+        # =========================================================
         else:
+            # 1. 判定当前使用的模式
             use_entropy = (self.conf_method == "entropy")
+            use_cosine = (self.conf_method == "cosine") 
+            use_semantic = (self.conf_method == "semantic")
+            # 检查是否加载了 Predictor
             use_learned_conf = (getattr(self, 'conf_predictor', None) is not None)
             
-            # 统计模式配置
+            # 2. 统计模式配置 (Fallback)
             window_steps = None
             is_trajectory_mode = False
             sigma_delta = None
             mu_u, sigma_u = None, None
             
-            if not use_entropy and not use_learned_conf:
+            # 如果没用以上任何高级模式，则回退到统计模式
+            if not any([use_entropy, use_cosine, use_semantic, use_learned_conf]):
                 window_steps = self._get_confidence_window()
                 if not window_steps: window_steps = list(range(self.diffloss.gen_diffusion.num_timesteps))
                 stats = self._get_confidence_stats(tokens.device)
@@ -1056,29 +1208,34 @@ class MAR(nn.Module):
 
             if is_main_process():
                 if use_learned_conf: print(f"[Dynamic-MaskGIT] Running in Learned Predictor Mode.")
-                elif use_entropy: print(f"[Dynamic-MaskGIT] Running in Entropy Mode.")
-                else: print(f"[Dynamic-MaskGIT] Running in Stats/Trajectory Mode.")
+                elif use_cosine:     print(f"[Dynamic-MaskGIT] Running in Cosine Trajectory Mode.")
+                elif use_semantic:   print(f"[Dynamic-MaskGIT] Running in Semantic Consistency Mode.")
+                elif use_entropy:    print(f"[Dynamic-MaskGIT] Running in Entropy Mode.")
+                else:                print(f"[Dynamic-MaskGIT] Running in Stats/Trajectory Mode.")
 
             round_idx = 0
             unfinished_batch_mask = torch.ones(bsz, dtype=torch.bool, device=tokens.device)
-            # [关键] 用于存储每个 Token 已生成的置信度，供 Remask 使用
             saved_confidence = torch.full((bsz, num_hr_tokens), -1.0, device=device)
             
             # Remask 参数配置
-            remask_rate = 0.02 # 每次最多回退 2% 的 Token
+            remask_rate = 0.02 
             num_remask = max(1, int(num_hr_tokens * remask_rate))
 
-            # 阈值策略
+            # 3. 阈值策略配置
             if use_entropy:
                 start_threshold = max(0.01, self.conf_threshold - 0.2)
                 end_threshold = self.conf_threshold + 0.3
                 ramp_steps = 6.0
                 stochastic_scale = 1.0
-            elif use_learned_conf:
+            
+            elif use_learned_conf or use_cosine or use_semantic:
+                # [核心] Predictor, Cosine 和 Semantic 的 Uncertainty 都是越小越好
+                # 范围通常在 [0, 1] 或 [0, 2] 之间
                 start_threshold = max(0.0, self.conf_threshold - 0.1)
-                end_threshold = self.conf_threshold + 0.1
+                end_threshold = self.conf_threshold + 0.4
                 ramp_steps = 10.0 
-                stochastic_scale = 0.0
+                stochastic_scale = 0.0 # 确定性较高，无需太大随机扰动
+                
             elif is_trajectory_mode:
                 start_threshold = max(0.0, self.conf_threshold - 0.5)
                 end_threshold = self.conf_threshold + 0.1
@@ -1090,6 +1247,7 @@ class MAR(nn.Module):
                 ramp_steps = 6.0
                 stochastic_scale = 1.0
 
+            # --- 采样循环 ---
             while unfinished_batch_mask.any():
                 active_indices = torch.nonzero(unfinished_batch_mask).squeeze(1)
                 curr_bsz_active = active_indices.shape[0]
@@ -1102,7 +1260,7 @@ class MAR(nn.Module):
                 cond_dec_active = cond_tokens_decoder[active_indices] if cond_tokens_decoder is not None else None
                 gate_mul_active = gate_multiplier[active_indices] if (torch.is_tensor(gate_multiplier) and gate_multiplier.shape[0] == bsz) else gate_multiplier
 
-                # --- 1. Forward Pass ---
+                # 1. Forward Pass
                 z_list, pos_embed_list, entropy_list = [], [], []
                 for i in range(curr_bsz_active):
                     t_i, m_i, l_i = tokens_active[i:i+1], mask_active[i:i+1], lr_tokens_active[i:i+1]
@@ -1128,42 +1286,77 @@ class MAR(nn.Module):
 
                 z_cond_active = z_active[indices_to_pred_active] + pos_embed_active[indices_to_pred_active]
 
-                # --- 2. 采样与 Predictor 推理 ---
+                # 2. 采样与置信度计算
                 u_map = None
                 sampled_token_latent = None
                 
-                if use_entropy:
-                    sampled_token_latent = self.diffloss.sample(z_cond_active, temperature, return_confidence=False)
-                    u_map = entropy_active[indices_to_pred_active]
-                
-                elif use_learned_conf:
-                    # === Predictor 核心 ===
+                if use_learned_conf:
+                    # === [模式 1] Learned Predictor (CNN) ===
+                    # 1. 正常采样当前步的 Token
                     sampled_token_latent = self.diffloss.sample(z_cond_active, temperature, return_confidence=False)
                     
-                    # 还原 Map
-                    temp_tokens = tokens_active.clone()
-                    temp_tokens[indices_to_pred_active] = sampled_token_latent
-                    sr_map = self.unpatchify(temp_tokens, shape=shape_hr)
+                    # 2. 准备 Predictor 的输入 (只需要 LR)
+                    # lr_tokens_active 是 patch 后的 [B_active, L, D] -> 变回 [B_active, D, H, W]
                     lr_map = self.unpatchify(lr_tokens_active, shape=shape_lr)
                     
-                    # 预测
+                    # 3. 预测难度 (Uncertainty)
+                    # 输入: LR Latent Map
+                    # 输出: Error Map [B, 1, H, W] (值越大 = 越难 = 不确定度越高)
                     with torch.no_grad():
-                        conf_map = self.conf_predictor(sr_map, lr_map)
+                        pred_error_map = self.conf_predictor(lr_map)
                     
-                    # 提取 Uncertainty
-                    conf_flat = conf_map.flatten(2).squeeze(1)
-                    valid_conf = conf_flat[indices_to_pred_active]
-                    u_map = 1.0 - valid_conf # 越小越好
+                    # 4. 提取对应位置的不确定度
+                    u_map_flat = pred_error_map.flatten(2).squeeze(1) # [B, L]
+                    u_map = u_map_flat[indices_to_pred_active] # 只取当前 active 位置
+                    
+                    # 注意: 不需要 1.0 - u_map，因为现在预测的就是误差(难度)
+
+                elif use_entropy:
+                    # === [模式 2] Entropy ===
+                    sampled_token_latent = self.diffloss.sample(z_cond_active, temperature, return_confidence=False)
+                    u_map = entropy_active[indices_to_pred_active]
 
                 else:
-                    conf_acc = TrajectoryConfidenceAccumulator(window_steps, sigma_delta=sigma_delta) if is_trajectory_mode else VarianceConfidenceAccumulator(window_steps)
-                    sampled_token_latent, u_map_raw = self.diffloss.sample(z_cond_active, temperature, confidence_accumulator=conf_acc, return_confidence=True)
-                    u_map = u_map_raw if is_trajectory_mode else standardize(u_map_raw, mu_u, sigma_u)
+                    # === [模式 3,4,5,6] Accumulator 模式 ===
+                    conf_acc = None
+                    if use_cosine:
+                        # [模式 3] Cosine Trajectory
+                        cosine_window = self._get_confidence_window()
+                        if not cosine_window: cosine_window = list(range(self.diffloss.gen_diffusion.num_timesteps))
+                        conf_acc = CosineTrajectoryAccumulator(cosine_window)
+                    elif use_semantic:
+                        # [模式 4] Semantic Consistency
+                        semantic_window = self._get_confidence_window()
+                        if not semantic_window: semantic_window = list(range(self.diffloss.gen_diffusion.num_timesteps))
+                        # 提取对应位置的 LR 特征作为 Target
+                        target_lr_features = lr_tokens_active[indices_to_pred_active]
+                        conf_acc = SemanticConsistencyAccumulator(target_features=target_lr_features, window_steps=semantic_window)
+                    elif is_trajectory_mode:
+                        # [模式 5] Energy
+                        conf_acc = TrajectoryConfidenceAccumulator(window_steps, sigma_delta=sigma_delta)
+                    else:
+                        # [模式 6] Variance
+                        conf_acc = VarianceConfidenceAccumulator(window_steps)
+                    
+                    sampled_token_latent, u_map_raw = self.diffloss.sample(
+                        z_cond_active, temperature, confidence_accumulator=conf_acc, return_confidence=True
+                    )
+                    
+                    # 标准化处理
+                    if use_cosine or use_semantic or is_trajectory_mode:
+                            u_map = u_map_raw # 不需要 z-score 标准化
+                    else:
+                            u_map = standardize(u_map_raw, mu_u, sigma_u)
 
                 if u_map is None or u_map.numel() == 0:
                     u_map = torch.zeros(z_cond_active.shape[0], device=z_cond_active.device)
-                
-                # --- 3. 筛选 ---
+
+                if is_main_process():
+                    u_min = u_map.min().item()
+                    u_max = u_map.max().item()
+                    u_mean = u_map.mean().item()
+                    print(f"  [Round {round_idx}] Uncertainty Stats: Min={u_min:.4f}, Max={u_max:.4f}, Mean={u_mean:.4f}")
+                # 3. 筛选与更新
                 u_std = u_map + torch.randn_like(u_map) * stochastic_scale
                 u_std_flat = u_std.reshape(-1)
                 
@@ -1183,57 +1376,48 @@ class MAR(nn.Module):
                 pass_indices = (indices_to_pred_active[0][pass_mask_flat], indices_to_pred_active[1][pass_mask_flat])
                 fail_indices = (indices_to_pred_active[0][fail_mask_flat], indices_to_pred_active[1][fail_mask_flat])
                 
-                # --- 4. 更新 Token 与 Mask ---
                 cur_tokens_active = tokens_active.clone()
                 cur_tokens_active[pass_indices] = sampled_token_latent[pass_mask_flat]
                 if fail_mask_flat.any():
                     if self.remask_mode == "keep": cur_tokens_active[fail_indices] = sampled_token_latent[fail_mask_flat]
                     else: cur_tokens_active[fail_indices] = 0 
                 
-                mask_active[pass_indices] = 0 # 接受的变为 0 (可见)
+                mask_active[pass_indices] = 0
                 
-                # [恢复] 记录已生成 Token 的分数，供 Remask 使用
+                # 记录置信度 (供 Remask 使用)
                 if pass_mask_flat.any():
                     acc_local_b = indices_to_pred_active[0][pass_mask_flat]
                     acc_t = indices_to_pred_active[1][pass_mask_flat]
                     acc_global_b = active_indices[acc_local_b]
-                    saved_confidence[acc_global_b, acc_t] = u_map[pass_mask_flat]
+                    saved_confidence[acc_global_b, acc_t] = u_map[pass_mask_flat].to(saved_confidence.dtype)
 
-                # # === Remask 逻辑 ===
-                # # 检查已生成的区域，如果发现很差的 token，重新 mask 掉
+                # === Remask 逻辑 (保持注释) ===
                 # for i in range(curr_bsz_active):
                 #     global_idx = active_indices[i]
                 #     local_idx = i
                 #     current_mask_count = mask_active[local_idx].sum().item()
                 #     current_ratio = current_mask_count / num_hr_tokens
                     
-                #     # 如果 Mask 比例已经很低了 (< 5%)，就不再回退了，全力冲刺
                 #     if current_ratio < 0.05: 
                 #         continue
                     
-                #     # 找出已生成的区域
                 #     known_mask = (mask_active[local_idx] == 0)
                 #     known_indices = known_mask.nonzero(as_tuple=True)[0]
                     
                 #     if len(known_indices) > num_remask:
-                #         # 从 saved_confidence 中取出这些位置的分数
-                #         # 注意：saved_confidence 存的是 Uncertainty (越大越差)
+                #         # 取出最差的 K 个
                 #         scores = saved_confidence[global_idx, known_indices]
-                        
-                #         # 找出分数最高的 k 个 (Worst K / 最不确定的 K 个)
                 #         topk = torch.topk(scores, k=num_remask, largest=True)
                 #         candidates_idx = known_indices[topk.indices]
                         
-                #         # 重新 Mask 掉
+                #         # 重新 Mask
                 #         mask_active[local_idx, candidates_idx] = 1
-                #         # 对应的 confidence 重置
                 #         saved_confidence[global_idx, candidates_idx] = -1.0
 
                 # 应用更新
                 tokens[active_indices] = cur_tokens_active
                 mask[active_indices] = mask_active
 
-                # 检查完成状态
                 if (mask_active.sum(dim=-1) == 0).any():
                     unfinished_batch_mask[active_indices[(mask_active.sum(dim=-1) == 0)]] = False
 
@@ -1243,7 +1427,6 @@ class MAR(nn.Module):
             actual_steps = round_idx
             
         return self.unpatchify(tokens, shape=shape_hr), actual_steps
-
 
 def mar_base(**kwargs):
     model = MAR(
