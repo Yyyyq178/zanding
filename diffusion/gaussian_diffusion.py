@@ -273,6 +273,8 @@ class GaussianDiffusion:
         """
         if model_kwargs is None:
             model_kwargs = {}
+        else:
+            model_kwargs = model_kwargs.copy()
 
         cfg_scale = model_kwargs.pop("cfg_scale", None)
         cfg_uncond = model_kwargs.pop("cfg_uncond", None)

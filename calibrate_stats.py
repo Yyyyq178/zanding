@@ -6,7 +6,6 @@ import torch.backends.cudnn as cudnn
 from tqdm import tqdm
 
 from models import mar 
-# 注意：这里引用 models.mar 主要是为了使用其中的辅助函数，具体的 accumulator 逻辑我们在本文件内部实现或通过 hook 注入
 from dataset.dataset_sr import SRDataset
 from dataset.dataset_paired import PairedSRDataset 
 from dataset.codeformer import CodeFormerDegradation 
@@ -53,6 +52,11 @@ def get_args_parser():
     # 校准专用参数
     parser.add_argument('--conf_window', type=str, default='40:10', help='Timesteps window for collecting stats')
     parser.add_argument('--calib_batches', default=50, type=int, help='Number of batches to use for calibration')
+
+    # CFG 相关参数
+    parser.add_argument('--cfg_scale', type=float, default=1.0, help='CFG scale for calibration')
+    parser.add_argument('--cfg_null_mode', default='zero', choices=['zero']) 
+    parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature') 
     
     # 兼容性参数 (推理脚本中存在但校准不使用的参数)
     parser.add_argument('--use_dynamic_maskgit', action='store_true')
@@ -95,8 +99,10 @@ class DeltaCollector:
         
         # 更新上一帧
         self.x0_prev = x_start.detach().clone()
+        
     def finalize(self):
         return None
+
 @torch.no_grad()
 def main(args):
     device = torch.device(args.device)
@@ -119,7 +125,8 @@ def main(args):
         num_sampling_steps=args.num_sampling_steps,
         use_lr_inject=args.use_lr_inject,
         use_rope=args.use_rope,
-        conf_window=args.conf_window # 这里会解析窗口字符串
+        conf_window=args.conf_window, # 这里会解析窗口字符串
+        cfg_null_mode=args.cfg_null_mode # 传入 CFG 模式
     )
     
     # 2. 加载权重
@@ -163,12 +170,16 @@ def main(args):
     if not window_steps:
         # 如果未指定，默认覆盖所有步数 (通常不建议，应指定如 40:10)
         window_steps = list(range(model.diffloss.gen_diffusion.num_timesteps))
+    
     print(f"Calibration Window Steps: {window_steps}")
+    print(f"CFG Scale: {args.cfg_scale}, Temperature: {args.temperature}")
+    if args.cfg_scale > 1.0:
+        print(f"Running in Calibration Mode (Null Mode: {args.cfg_null_mode})")
+    
     print(f"Starting Trajectory Stability Calibration on {args.calib_batches} batches...")
     
     # 用于累积统计量的变量 (均值和方差的在线计算)
     # 目标：计算 sigma_c = Std(Delta_c)
-    # 我们需要累积 Sum(x) 和 Sum(x^2)
     sum_delta = None    # [C]
     sum_sq_delta = None # [C]
     n_samples = 0       # Total pixels count (Batch * TimeSteps * H * W)
@@ -197,7 +208,7 @@ def main(args):
         lr_tokens = model.patchify(x_lr)
         hr_tokens = model.patchify(x_hr)
         
-        # 随机 Mask 模拟 (使用模型内部的 mask_ratio_generator)
+        # 随机 Mask 模拟
         bsz, num_tokens, _ = hr_tokens.shape
         orders = model.sample_orders(bsz, num_tokens)
         mask = model.random_masking(hr_tokens, orders)
@@ -205,7 +216,7 @@ def main(args):
         if mask.sum() == 0:
             continue
 
-        # 构建 Condition Tokens
+        # 构建 Condition Tokens (有条件)
         cond_tokens_encoder = None
         cond_tokens_decoder = None
         if model.use_lr_inject:
@@ -221,17 +232,19 @@ def main(args):
         shape_hr = (model.seq_h, model.seq_w)
         shape_lr = (model.seq_h, model.seq_w)
 
-        # MAE Forward 生成 z_cond
+        # MAE Forward 生成 z_cond (有条件)
         x = model.forward_mae_encoder(
             hr_tokens, mask, lr_tokens, shape_hr, shape_lr,
             cond_tokens=cond_tokens_encoder
         )
-        z, pos_embed = model.forward_mae_decoder(
+        
+        # [修改点 1] 添加 _ 接收多余的返回值
+        z, pos_embed, _ = model.forward_mae_decoder(
             x, mask, shape_hr, shape_lr,
             cond_tokens=cond_tokens_decoder
         )
         
-        # 提取被遮挡部分进行预测
+        # 提取被遮挡部分
         mask_bool = mask.bool()
         indices_to_pred = mask_bool.nonzero(as_tuple=True)
         z_sub = z[indices_to_pred]
@@ -241,41 +254,67 @@ def main(args):
         if torch.isnan(z_cond).any():
              continue
 
-        # === 核心：运行采样并收集 Delta ===
+        # === CFG 无条件分支构造 ===
+        z_uncond = None
+        if args.cfg_scale > 1.0:
+            # 1. 构造全 0 输入 (无条件)
+            x_lr_zeros = torch.zeros_like(x_lr)
+            lr_tokens_zeros = torch.zeros_like(lr_tokens)
+            
+            # 2. 生成无条件 Condition Tokens
+            cond_enc_un, cond_dec_un = model._build_lr_cond_tokens(x_lr_zeros, lr_tokens=lr_tokens_zeros)
+            
+            # 3. 运行无条件分支的 MAE (Encoder + Decoder)
+            # 关键：mask 必须和有条件分支保持完全一致
+            x_un = model.forward_mae_encoder(
+                hr_tokens, mask, lr_tokens_zeros, shape_hr, shape_lr,
+                cond_tokens=cond_enc_un
+            )
+            
+            # [修改点 2] 统一使用 3 变量解包
+            z_un_full, pos_un_full, _ = model.forward_mae_decoder(
+                x_un, mask, shape_hr, shape_lr,
+                cond_tokens=cond_dec_un
+            )
+            
+            # 4. 提取对应位置的 Latent
+            z_sub_un = z_un_full[indices_to_pred]
+            pos_sub_un = pos_un_full[indices_to_pred]
+            z_uncond = z_sub_un + pos_sub_un
+        # ================================
+
+        # === 运行采样并收集 Delta ===
         collector = DeltaCollector(window_steps)
         
-        # 传入 collector 到采样函数
-        # 注意：需要确保 models/diffloss.py 中的 sample 循环已修改为调用 collector.update(t, x_start=pred_xstart)
+        # 传入 collector 和 CFG 参数到采样函数
         model.diffloss.sample(
             z_cond, 
-            temperature=1.0, 
+            temperature=args.temperature, 
             confidence_accumulator=collector, 
-            return_confidence=False
+            return_confidence=False,
+            cfg_scale=args.cfg_scale,   
+            z_uncond=z_uncond           
         )
         
         if not collector.deltas:
             continue
             
         for delta_batch in collector.deltas:
-            # 1. 获取通道数
-            # delta_batch: [N, D] -> D 是通道数 (例如 16)
+            # delta_batch: [N, D]
             D = delta_batch.shape[1]
             
-            # 2. 转置为 [Channels, N_masked_tokens] 以便后续按行求和
-            # 使用 double 精度防止累积误差
+            # 转置为 [Channels, N_masked_tokens]
             flat_delta = delta_batch.transpose(0, 1).double() 
-            
             curr_n = flat_delta.shape[1]
             
             if sum_delta is None:
                 sum_delta = torch.zeros(D, dtype=torch.float64)
                 sum_sq_delta = torch.zeros(D, dtype=torch.float64)
             
-            # 3. 累积 Sum 和 SumSq (dim=1 是沿着 N_tokens 维度求和)
+            # 累积 Sum 和 SumSq
             sum_delta += flat_delta.sum(dim=1)
             sum_sq_delta += (flat_delta ** 2).sum(dim=1)
             n_samples += curr_n
-        # === 修改结束 ===
 
     # 6. 计算最终统计量
     if n_samples > 0:
@@ -288,11 +327,9 @@ def main(args):
         var = torch.relu(var)
         std = torch.sqrt(var).float()
         
-        # 鲁棒性：下界 clamp (避免除以0或极小值)
         sigma_min = 1e-4
         std = torch.clamp(std, min=sigma_min)
         
-        # 转 numpy
         sigma_delta_np = std.numpy()
         
         print("-" * 30)
@@ -302,12 +339,12 @@ def main(args):
         
         # 保存
         os.makedirs(args.output_dir, exist_ok=True)
-        # 注意文件名最好包含窗口信息，防止混淆
         conf_window_str = args.conf_window.replace(":", "_") if args.conf_window else "all"
-        save_name = f"confidence_stats.npz" 
+        
+        # 文件名带上 cfg_scale 和 temperature，方便管理
+        save_name = f"confidence_stats_cfg{args.cfg_scale:.1f}_temp{args.temperature:.1f}.npz"
         save_path = os.path.join(args.output_dir, save_name)
         
-        # 仅保存 sigma_delta，这标志着这是新版统计文件
         np.savez(save_path, sigma_delta=sigma_delta_np)
         print(f"Statistics saved to: {save_path}")
         print(f"Usage: Please use --conf_window '{args.conf_window}' during inference.")

@@ -11,19 +11,22 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --batch_size 1 \
     --eval_bsz 16 \
     --img_size 512 \
-    --resume output_Resume \
+    --resume output_Resume_cfg0.1 \
     --evaluate \
-    --cfg_scale 2.0 \
+    --cfg_scale 1.2 \
+    --temperature 0.95 \
     --paired_test \
     --hr_data_path /root/autodl-tmp/zanding/CelebA-Test-400/HQ \
     --lr_data_path /root/autodl-tmp/zanding/CelebA-Test-400/LQ \
     --use_lr_inject \
     --use_rope \
-    --use_dynamic_maskgit \
-    --conf_threshold 0.6 \
-    --conf_pmin 0.05 \
     --use_mse_loss \
-    --predictor_ckpt output_predictor/predictor_latest.pth \
-    --output_dir Evaluate_Resume_predictor-new_0.5_0.05_16_0.5-0.8
-    # --conf_method semantic \
-    # --conf_window '100:0:10' \
+    --use_dynamic_maskgit \
+    --conf_threshold 1.0 \
+    --conf_pmin 0.05 \
+    --conf_method stats \
+    --conf_window '40:10' \
+    --output_dir Evaluate_Resume_cfg0.1_16——1.2-0.95_X0
+    
+    #--predictor_ckpt output_predictor/predictor_latest.pth \
+    
