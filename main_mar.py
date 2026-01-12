@@ -3,6 +3,7 @@ import datetime
 import numpy as np
 import os
 import time
+import glob
 from pathlib import Path
 
 import torch
@@ -472,14 +473,13 @@ def main(args):
         ema_params = copy.deepcopy(model_params)
         print("Training from scratch")
 
-    # evaluate FID and IS
     if args.evaluate:
         torch.cuda.empty_cache()
         evaluate(model_without_ddp, vae, ema_params, args, 0, batch_size=args.eval_bsz, log_writer=log_writer,
                  use_ema=True, data_loader=data_loader_val, paired_mode=args.paired_test,
                  swinir_model=swinir_model)
         return
-
+    best_psnr = -1.0
     # training
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
@@ -487,7 +487,7 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(
+        train_stats = train_one_epoch(
             model, vae,
             model_params, ema_params,
             data_loader_train,
@@ -496,19 +496,80 @@ def main(args):
             args=args,
             swinir_model=swinir_model
         )
-
         # save checkpoint
         if epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs:
             misc.save_model(args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                             loss_scaler=loss_scaler, epoch=epoch, ema_params=ema_params, epoch_name="last")
 
-        # online evaluation
+        long_term_freq = 50
+        if (epoch % long_term_freq == 0 and epoch > 0) or epoch + 1 == args.epochs:
+            # 保存当前的长周期存档 
+            misc.save_model(
+                args=args, model=model, model_without_ddp=model_without_ddp, 
+                optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch, 
+                ema_params=ema_params, 
+                epoch_name=str(epoch) 
+            )
+        if misc.is_main_process():
+                try:
+                    # 获取所有带数字的权重文件
+                    all_files = glob.glob(os.path.join(args.output_dir, 'checkpoint-*.pth'))
+                    long_term_ckpts = []
+                    
+                    for p in all_files:
+                        fname = os.path.basename(p)
+                        # 排除 last 和 best
+                        if 'last' in fname or 'best' in fname:
+                            continue
+                        
+                        # 尝试解析文件名中的数字
+                        try:
+                            # 提取数字，例如 "checkpoint-200.pth" -> 200
+                            e_num = int(fname.replace('checkpoint-', '').replace('.pth', ''))
+                            
+                            # 只管理那些符合长周期倍数的文件 (防止误删其他手动存的文件)
+                            if e_num % long_term_freq == 0:
+                                long_term_ckpts.append((e_num, p))
+                        except ValueError:
+                            continue 
+
+                    # 按 epoch 从大到小排序 (300, 250, 200...)
+                    long_term_ckpts.sort(key=lambda x: x[0], reverse=True)
+                    
+                    # 只保留最近的 2 个 (例如 300 和 250)
+                    keep_num = 2 
+                    if len(long_term_ckpts) > keep_num:
+                        # 删除多余的 (例如 200, 150...)
+                        for _, p_to_remove in long_term_ckpts[keep_num:]:
+                            os.remove(p_to_remove)
+                            print(f"[Auto-Clean] Removed old long-term checkpoint: {os.path.basename(p_to_remove)}")
+                            
+                except Exception as e:
+                    print(f"Error during checkpoint cleanup: {e}")
+
+        # checkpoint-best.pth
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
-            evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=args.eval_bsz, log_writer=log_writer,
-                     use_ema=True, data_loader=data_loader_val
-                     , swinir_model=swinir_model
-                     )
+            eval_metrics = evaluate(model_without_ddp, vae, ema_params, args, epoch, 
+                                    batch_size=args.eval_bsz, log_writer=log_writer,
+                                    use_ema=True, data_loader=data_loader_val, 
+                                    swinir_model=swinir_model)
+            
+            # 提取 PSNR
+            current_psnr = eval_metrics.get('psnr', 0.0)
+            
+            # 只有创新高才保存/覆盖
+            if current_psnr > best_psnr:
+                best_psnr = current_psnr
+                misc.save_model(
+                    args=args, model=model, model_without_ddp=model_without_ddp, 
+                    optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch, 
+                    ema_params=ema_params, 
+                    epoch_name="best" # 覆盖 checkpoint-best.pth
+                )
+                if misc.is_main_process():
+                    print(f"🌟 New Best PSNR: {best_psnr:.2f}! Saved checkpoint-best.pth")
+            
             torch.cuda.empty_cache()
 
         if misc.is_main_process():
