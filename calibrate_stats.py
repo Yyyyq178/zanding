@@ -9,7 +9,7 @@ from models import mar
 from dataset.dataset_sr import SRDataset
 from dataset.dataset_paired import PairedSRDataset 
 from dataset.codeformer_face import CodeFormerDegradation as CodeFormerDegradationFace
-from dataset.codeformer_natural import CodeFormerDegradationNatural
+from dataset.realesrgan_natural import RealESRGANDegradationNatural
 from models.swinir import SwinIR
 from engine_mar import preprocess_with_swinir
 
@@ -66,7 +66,7 @@ def get_args_parser():
     parser.add_argument('--conf_threshold', type=float, default=0.0)
     parser.add_argument('--conf_pmin', type=float, default=0.01)
     parser.add_argument('--degradation', default='codeformer', type=str,
-                        help='Degradation type: codeformer (face) or codeformer_natural')
+                        help='Degradation type: codeformer (face) or realesrgan_natural')
     
     parser.add_argument('--use_swinir', action='store_true', help='Use SwinIR for preprocessing')
     parser.add_argument('--swinir_ckpt', type=str, default='pretrained_models/swinir/face_swinir_v1.ckpt')
@@ -199,9 +199,9 @@ def main(args):
             is_train=False, 
             degradation_type='codeformer'
         )
-        if args.degradation == 'codeformer_natural':
+        if args.degradation == 'realesrgan_natural':
             print("Initializing Natural Degradation (Fixed 4x)...")
-            degradation_model = CodeFormerDegradationNatural().to(device)
+            degradation_model = RealESRGANDegradationNatural().to(device)
         else:
             print("Initializing Face Degradation (Random 1-12x)...")
             degradation_model = CodeFormerDegradationFace().to(device)

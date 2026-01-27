@@ -4,7 +4,6 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --diffloss_d 6 \
     --diffloss_w 1024 \
     --vae_path pretrained_models/vae/kl16.ckpt \
-    --buffer_size 64 \
     --vae_embed_dim 16 \
     --vae_stride 16 \
     --patch_size 1 \

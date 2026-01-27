@@ -16,6 +16,7 @@ python calibrate_stats.py \
     --diffloss_d 6 \
     --diffloss_w 1024 \
     --num_sampling_steps "ddim100" \
+    --degradation codeformer \
     --resume "output_Resume/checkpoint-last.pth" \
     --hr_data_path "/root/autodl-tmp/zanding/CelebA-Test-3000/HQ" \
     --lr_data_path "/root/autodl-tmp/zanding/CelebA-Test-3000/LQ" \

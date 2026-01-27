@@ -9,7 +9,7 @@ import util.misc as misc
 import util.lr_sched as lr_sched
 import torch.nn.functional as F
 from dataset.codeformer_face import CodeFormerDegradation as CodeFormerDegradationFace
-from dataset.codeformer_natural import CodeFormerDegradationNatural
+from dataset.realesrgan_natural import RealESRGANDegradationNatural
 import pyiqa
 import shutil
 import cv2
@@ -127,8 +127,10 @@ def train_one_epoch(model, vae,
     if args.steps_per_epoch > 0 and args.steps_per_epoch < len(data_loader):
         num_steps_per_epoch = args.steps_per_epoch
 
-    if args.degradation == 'codeformer_natural':
-        degradation_model = CodeFormerDegradationNatural()
+    if args.degradation == 'realesrgan_natural':
+        degradation_model = RealESRGANDegradationNatural()
+        if misc.get_rank() == 0 and data_iter_step == 0:
+            print("Using Natural Degradation: Real-ESRGAN (High-Order)")
     else:
         degradation_model = CodeFormerDegradationFace()
 
@@ -258,8 +260,8 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         return
     
     if not paired_mode:
-        if args.degradation == 'codeformer_natural':
-            DegradationClass = CodeFormerDegradationNatural
+        if args.degradation == 'realesrgan_natural':
+            DegradationClass = RealESRGANDegradationNatural
         else:
             DegradationClass = CodeFormerDegradationFace
 

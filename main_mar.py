@@ -28,9 +28,9 @@ def get_args_parser():
     parser = argparse.ArgumentParser('MAR training with Diffusion Loss', add_help=False)
     parser.add_argument('--batch_size', default=16, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * # gpus')
-    parser.add_argument('--epochs', default=400, type=int)
+    parser.add_argument('--epochs', default=1000, type=int)
     parser.add_argument('--degradation', default='codeformer', type=str,
-                        help='Degradation type: codeformer (face), codeformer_natural')
+                        help='Degradation type: codeformer (face), realesrgan_natural')
     parser.add_argument('--use_swinir', action='store_true', help='Clean CodeFormer LR images with SwinIR')
     parser.add_argument('--swinir_ckpt', default='pretrained_models/swinir/face_swinir_v1.ckpt', type=str,
                         help='Path to SwinIR checkpoint used for LR preprocessing')
@@ -55,7 +55,7 @@ def get_args_parser():
 
     # Generation parameters
     parser.add_argument('--num_iter', default=64, type=int,
-                        help='number of autoregressive iterations to generate an image')
+                        help='number of autoregressive iterations to restoration an image')
     parser.add_argument('--num_images', default=70000, type=int,
                         help='number of images to generate')
     parser.add_argument('--use_dynamic_maskgit', action='store_true',
@@ -82,9 +82,6 @@ def get_args_parser():
     parser.add_argument('--eval_bsz', type=int, default=64, help='generation batch size')
 
     # Optimizer parameters
-    parser.add_argument('--weight_decay', type=float, default=0.02,
-                        help='weight decay')
-
     parser.add_argument('--grad_checkpointing', action='store_true')
     parser.add_argument('--lr', type=float, default=5e-5, help='Peak learning rate')
     
@@ -98,9 +95,9 @@ def get_args_parser():
                         help='Initial lr ratio (relative to peak)')
     parser.add_argument('--wpe', type=float, default=0.01, 
                         help='Final lr ratio')
-    parser.add_argument('--weight_decay', type=float, default=0.05, 
+    parser.add_argument('--weight_decay', type=float, default=0.02, 
                         help='Initial WD')
-    parser.add_argument('--weight_decay_end', type=float, default=0.05, 
+    parser.add_argument('--weight_decay_end', type=float, default=0.02, 
                         help='Final WD. Set smaller to enable annealing.')
     parser.add_argument('--ema_rate', default=0.9999, type=float)
 
@@ -113,7 +110,6 @@ def get_args_parser():
                         help='attention dropout')
     parser.add_argument('--proj_dropout', type=float, default=0.1,
                         help='projection dropout')
-    parser.add_argument('--buffer_size', type=int, default=64)
     parser.add_argument('--cfg_scale', type=float, default=1.0,
                         help='Classifier-free guidance scale for sampling')
     parser.add_argument('--cfg_drop_prob', type=float, default=0.1,
@@ -130,8 +126,8 @@ def get_args_parser():
                         choices=['encoder', 'vae_latent', 'patch_embed'],
                         help='LR condition feature source')
     # Diffusion Loss params
-    parser.add_argument('--diffloss_d', type=int, default=12)
-    parser.add_argument('--diffloss_w', type=int, default=1536)
+    parser.add_argument('--diffloss_d', type=int, default=6)
+    parser.add_argument('--diffloss_w', type=int, default=1024)
     parser.add_argument('--num_sampling_steps', type=str, default="ddim100")
     parser.add_argument('--diffusion_batch_mul', type=int, default=1)
     parser.add_argument('--temperature', default=1.0, type=float, help='diffusion loss sampling temperature')
@@ -208,14 +204,14 @@ def main(args):
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
 
-    # [修正] 提前初始化 Log Writer，确保全局可用
+    # 提前初始化 Log Writer，确保全局可用
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.log_dir)
     else:
         log_writer = None
  
-    # 1. 初始化变量
+    # 初始化变量
     dataset_train = None
     data_loader_train = None
     sampler_train = None
@@ -223,7 +219,7 @@ def main(args):
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
 
-    # 2. 训练集加载 (仅在非评估模式下执行)
+    # 训练集加载 (仅在非评估模式下执行)
     if not args.evaluate:
         if args.use_cached:
             raise NotImplementedError("Cached mode needs update for SRDataset")
@@ -256,7 +252,7 @@ def main(args):
                 drop_last=True,
             )
 
-    # 3. 验证集/测试集加载 (核心修改部分)
+    # 验证集/测试集加载 (核心修改部分)
     # 这里的 import 放在这里是为了防止在没有该文件时影响训练
     from dataset.dataset_paired import PairedSRDataset, HROnlyDataset 
 
@@ -270,7 +266,7 @@ def main(args):
         )
     
     elif args.evaluate:
-        # [模式 B] 纯 HR 测试 (自动退化，读取扁平文件夹)
+        # 纯 HR 测试 (自动退化，读取扁平文件夹)
         # 这就是解决你 FileNotFoundError 的关键
         print(f"Loading HR-Only Test Dataset from {args.hr_data_path} (Flat Folder)")
         dataset_val = HROnlyDataset(
@@ -279,7 +275,7 @@ def main(args):
         )
         
     else:
-        # [模式 C] 训练时的验证 (需要标准 ImageFolder 结构)
+        # 训练时的验证 (需要标准 ImageFolder 结构)
         if args.val_data_path is not None:
             val_root = args.val_data_path
         else:
@@ -391,7 +387,6 @@ def main(args):
         mask_ratio_min=args.mask_ratio_min,
         attn_dropout=args.attn_dropout,
         proj_dropout=args.proj_dropout,
-        buffer_size=args.buffer_size,
         diffloss_d=args.diffloss_d,
         diffloss_w=args.diffloss_w,
         num_sampling_steps=args.num_sampling_steps,
@@ -425,10 +420,6 @@ def main(args):
     model_without_ddp = model
 
     eff_batch_size = args.batch_size * misc.get_world_size()
-    
-    if args.lr is None:
-        # 如果万一没传 lr (虽然我们设了默认值)，给一个安全值
-        args.lr = 1e-4 
     
     print("==============================================")
     print(f"Peak LR: {args.lr:.2e}")

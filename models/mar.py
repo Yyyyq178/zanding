@@ -379,7 +379,7 @@ class DifficultyPredictor(nn.Module):
 class MAR(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
     """
-    def __init__(self, img_size=256, vae_stride=16, patch_size=1,
+    def __init__(self, img_size=512, vae_stride=16, patch_size=1,
                  encoder_embed_dim=1024, encoder_depth=16, encoder_num_heads=16,
                  decoder_embed_dim=1024, decoder_depth=16, decoder_num_heads=16,
                  mlp_ratio=4., norm_layer=nn.LayerNorm,
@@ -387,11 +387,10 @@ class MAR(nn.Module):
                  mask_ratio_min=0.7,
                  attn_dropout=0.1,
                  proj_dropout=0.1,
-                 buffer_size=64,   #这里需要设置为LR转码后的长度
-                 diffloss_d=6,      #显存紧张可以降低
-                 diffloss_w=1024,   #可以与embed_dim保持一致
+                 diffloss_d=6,      
+                 diffloss_w=1024,  
                  num_sampling_steps='100',
-                 diffusion_batch_mul=1,         #单卡最好设为1，之前为4
+                 diffusion_batch_mul=1,       
                  grad_checkpointing=False,
                  mse_weight=0.2,
                  use_lr_inject=False,
@@ -443,15 +442,10 @@ class MAR(nn.Module):
 
         # --------------------------------------------------------------------------
         # MAR encoder specifics
-
-        # 投影层：把 VAE 的 16 维向量映射到 Transformer 的 1024 维
         self.z_proj = nn.Linear(self.token_embed_dim, encoder_embed_dim, bias=True)
         self.z_proj_ln = nn.LayerNorm(encoder_embed_dim, eps=1e-6)
-        #投影层：将 Decoder 维度 (768) 映射到 Token 维度 (16)
         self.final_proj = nn.Linear(decoder_embed_dim, self.token_embed_dim)
-        # 缓冲区大小：定义前缀长度 (64)
-        self.buffer_size = buffer_size
-        # 位置编码：这是一个可学习的参数表，长度 = 序列长度(256) + 缓冲区长度(64) = 320，维度 = 1024
+
         if not self.use_rope:
             lr_token_len = self.seq_h * self.seq_w
             total_tokens = lr_token_len + self.seq_len
