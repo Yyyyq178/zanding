@@ -160,7 +160,7 @@ def train_one_epoch(model, vae,
             posterior_lr = vae.encode(samples_lr)
             x_lr = posterior_lr.sample().mul_(0.2325)
 
-        with torch.amp.autocast('cuda'):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             model_out = model(
                 x_hr, x_lr, gate_multiplier=gate_multiplier,
             )
@@ -191,15 +191,14 @@ def train_one_epoch(model, vae,
         metric_logger.update(lr=lr)
 
         loss_value_reduce = misc.all_reduce_mean(loss_value)
+        loss_diff_mean = misc.all_reduce_mean(loss_diff.item())
+        loss_mse_mean = misc.all_reduce_mean(loss_mse.item())
         if log_writer is not None:
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
-            log_writer.add_scalar('train_loss_diff', misc.all_reduce_mean(loss_diff.item()), epoch_1000x)
-            log_writer.add_scalar('train_loss_mse', misc.all_reduce_mean(loss_mse.item()), epoch_1000x)
+            log_writer.add_scalar('train_loss_diff', loss_diff_mean, epoch_1000x)
+            log_writer.add_scalar('train_loss_mse', loss_mse_mean, epoch_1000x)
             log_writer.add_scalar('lr', lr, epoch_1000x)
-            if args.use_lr_inject:
-                log_writer.add_scalar('train_lr_inject_gate_mean', misc.all_reduce_mean(gate_mean), epoch_1000x)
-                log_writer.add_scalar('train_lr_inject_gate_multiplier', misc.all_reduce_mean(gate_multiplier), epoch_1000x)
 
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -303,7 +302,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
 
         # 生成 (Inference)
         with torch.no_grad():
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 # 调用 sample_tokens，传入 x_lr
                 sampled_tokens, real_steps = model_without_ddp.sample_tokens(
                     bsz=imgs_lr.shape[0], 
@@ -490,7 +489,7 @@ def save_comparison_images(sr, hr, lr, save_folder, batch_idx):
         x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0)
         
         # 限制范围并转 numpy
-        return x.clamp(0, 1).cpu().permute(0, 2, 3, 1).numpy()
+        return x.clamp(0, 1).cpu().permute(0, 2, 3, 1).float().numpy()
     
     sr_np = process(sr)
     hr_np = process(hr)

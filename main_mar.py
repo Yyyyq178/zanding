@@ -230,7 +230,6 @@ def main(args):
                 hr_size=args.img_size,
                 lr_size=args.img_size // 2,
                 is_train=True, 
-                degradation_type=args.degradation
             )
             print(dataset_train)
 

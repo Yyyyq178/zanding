@@ -28,9 +28,9 @@ class CodeFormerDegradation:
         blur_kernel_size=41,
         kernel_list=("iso", "aniso", "generalized_iso", "generalized_aniso"),
         kernel_prob=(0.5, 0.5, 0.25, 0.25),
-        blur_sigma=(0.1, 12),
-        downsample_range=(1, 12),
-        noise_range=(0, 15),
+        blur_sigma=(0.1, 15),
+        downsample_range=(0.8, 32),
+        noise_range=(0, 20),
         jpeg_range=(30, 100),
     ):
         self.blur_kernel_size = blur_kernel_size

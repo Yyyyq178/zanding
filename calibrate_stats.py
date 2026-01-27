@@ -196,8 +196,7 @@ def main(args):
             root=args.hr_data_path,
             hr_size=args.img_size,
             lr_size=args.img_size // 2,
-            is_train=False, 
-            degradation_type='codeformer'
+            is_train=False,
         )
         if args.degradation == 'realesrgan_natural':
             print("Initializing Natural Degradation (Fixed 4x)...")

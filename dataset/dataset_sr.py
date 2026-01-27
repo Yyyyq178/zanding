@@ -8,7 +8,7 @@ import numpy as np
 import os
 
 class SRDataset(Dataset):
-    def __init__(self, root, hr_size=512, lr_size=None, is_train=True, degradation_type='codeformer'):
+    def __init__(self, root, hr_size=512, lr_size=None, is_train=True):
         """
         Dataset：只负责读取 HR 图片并进行基础预处理。
         """

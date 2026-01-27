@@ -9,12 +9,11 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --vae_embed_dim 16 \
     --vae_stride 16 \
     --patch_size 1 \
-    --epochs 500 \
-    --warmup_epochs 10 \
+    --epochs 600 \
     --batch_size 8 \
     --grad_clip 1.0 \
     --cfg_drop_prob 0.1 \
-    --steps_per_epoch 1000 \
+    --steps_per_epoch 250 \
     --lr 5.0e-5 \
     --hr_data_path /root/autodl-tmp/zanding/data \
     --val_data_path /root/autodl-tmp/zanding/data \
@@ -24,7 +23,6 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --save_last_freq 2 \
     --eval_bsz 8 \
     --img_size 512 \
-    --lr_schedule cosine \
     --multi_scale \
     --use_lr_inject \
     --use_rope \
