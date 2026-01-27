@@ -32,3 +32,10 @@ logs
 *.json
 extract_images.py
 debug_log.txt
+1/
+DIV2K_Val/
+DRealSR/
+LR-DIV2K-past/
+RealSR/
+Test_x4/
+make_realsr.py

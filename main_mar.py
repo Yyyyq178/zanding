@@ -30,9 +30,9 @@ def get_args_parser():
                         help='Batch size per GPU (effective batch size is batch_size * # gpus')
     parser.add_argument('--epochs', default=400, type=int)
     parser.add_argument('--degradation', default='codeformer', type=str,
-                    help='Degradation type: codeformer or realesrgan')
+                        help='Degradation type: codeformer (face), codeformer_natural')
     parser.add_argument('--use_swinir', action='store_true', help='Clean CodeFormer LR images with SwinIR')
-    parser.add_argument('--swinir_ckpt', default='pretrained_models/swinir/face_full_v1.ckpt', type=str,
+    parser.add_argument('--swinir_ckpt', default='pretrained_models/swinir/face_swinir_v1.ckpt', type=str,
                         help='Path to SwinIR checkpoint used for LR preprocessing')
     parser.add_argument('--swinir_batch', type=int, default=4, help='Mini-batch size for SwinIR inference')
     # Model parameters
@@ -83,19 +83,25 @@ def get_args_parser():
 
     # Optimizer parameters
     parser.add_argument('--weight_decay', type=float, default=0.02,
-                        help='weight decay (default: 0.02)')
+                        help='weight decay')
 
     parser.add_argument('--grad_checkpointing', action='store_true')
-    parser.add_argument('--lr', type=float, default=None, metavar='LR',
-                        help='learning rate (absolute lr)')
-    parser.add_argument('--blr', type=float, default=1e-4, metavar='LR',
-                        help='base learning rate: absolute_lr = base_lr * total_batch_size / 256')
-    parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
-                        help='lower lr bound for cyclic schedulers that hit 0')
-    parser.add_argument('--lr_schedule', type=str, default='constant',
-                        help='learning rate schedule')
-    parser.add_argument('--warmup_epochs', type=int, default=100, metavar='N',
-                        help='epochs to warmup LR')
+    parser.add_argument('--lr', type=float, default=5e-5, help='Peak learning rate')
+    
+    parser.add_argument('--sche', type=str, default='lin0', 
+                        help='lin, cos, lin0.5, etc.')
+    parser.add_argument('--warmup_epochs', type=int, default=0, 
+                        help='If 0, will use --wp ratio to calculate. Manually set to override.')
+    parser.add_argument('--wp', type=float, default=0.1, 
+                        help='Warmup ratio of total epochs. Used if warmup_epochs is 0')
+    parser.add_argument('--wp0', type=float, default=0.005, 
+                        help='Initial lr ratio (relative to peak)')
+    parser.add_argument('--wpe', type=float, default=0.01, 
+                        help='Final lr ratio')
+    parser.add_argument('--weight_decay', type=float, default=0.05, 
+                        help='Initial WD')
+    parser.add_argument('--weight_decay_end', type=float, default=0.05, 
+                        help='Final WD. Set smaller to enable annealing.')
     parser.add_argument('--ema_rate', default=0.9999, type=float)
 
     # MAR params
@@ -183,7 +189,10 @@ def get_args_parser():
 
 def main(args):
     misc.init_distributed_mode(args)
-
+    if args.warmup_epochs == 0 and args.wp > 0:
+        args.warmup_epochs = int(args.epochs * args.wp)
+        if misc.is_main_process():
+            print(f"[Config] Auto-set warmup_epochs to {args.warmup_epochs} (Ratio {args.wp})")
     print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
     print("{}".format(args).replace(', ', ',\n'))
 
@@ -416,13 +425,17 @@ def main(args):
     model_without_ddp = model
 
     eff_batch_size = args.batch_size * misc.get_world_size()
-
-    if args.lr is None:  # only base_lr is specified
-        args.lr = args.blr * eff_batch_size / 256
-
-    print("base lr: %.2e" % (args.lr * 256 / eff_batch_size))
-    print("actual lr: %.2e" % args.lr)
-    print("effective batch size: %d" % eff_batch_size)
+    
+    if args.lr is None:
+        # 如果万一没传 lr (虽然我们设了默认值)，给一个安全值
+        args.lr = 1e-4 
+    
+    print("==============================================")
+    print(f"Peak LR: {args.lr:.2e}")
+    print(f"Warmup Epochs: {args.warmup_epochs} (Start LR: {args.lr * args.wp0:.2e})")
+    print(f"End LR: {args.lr * args.wpe:.2e}")
+    print(f"Effective Batch Size: {eff_batch_size}")
+    print("==============================================")
 
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
@@ -568,7 +581,7 @@ def main(args):
                     epoch_name="best" # 覆盖 checkpoint-best.pth
                 )
                 if misc.is_main_process():
-                    print(f"🌟 New Best PSNR: {best_psnr:.2f}! Saved checkpoint-best.pth")
+                    print(f"New Best PSNR: {best_psnr:.2f}! Saved checkpoint-best.pth")
             
             torch.cuda.empty_cache()
 

@@ -8,7 +8,8 @@ import torch.distributed as dist
 import util.misc as misc
 import util.lr_sched as lr_sched
 import torch.nn.functional as F
-from dataset.codeformer import CodeFormerDegradation
+from dataset.codeformer_face import CodeFormerDegradation as CodeFormerDegradationFace
+from dataset.codeformer_natural import CodeFormerDegradationNatural
 import pyiqa
 import shutil
 import cv2
@@ -126,7 +127,10 @@ def train_one_epoch(model, vae,
     if args.steps_per_epoch > 0 and args.steps_per_epoch < len(data_loader):
         num_steps_per_epoch = args.steps_per_epoch
 
-    degradation_model = CodeFormerDegradation()
+    if args.degradation == 'codeformer_natural':
+        degradation_model = CodeFormerDegradationNatural()
+    else:
+        degradation_model = CodeFormerDegradationFace()
 
     gate_multiplier = 1.0
 
@@ -254,7 +258,10 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         return
     
     if not paired_mode:
-        degradation_model = CodeFormerDegradation()
+        if args.degradation == 'codeformer_natural':
+            DegradationClass = CodeFormerDegradationNatural
+        else:
+            DegradationClass = CodeFormerDegradationFace
 
     sr_save_dir = os.path.join(save_folder, "sr_images")
     hr_save_dir = os.path.join(save_folder, "hr_images")
@@ -270,14 +277,17 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         imgs_hr = imgs_hr.cuda(args.device, non_blocking=True)
         imgs_lr = imgs_lr.cuda(args.device, non_blocking=True)
 
-        # if i >= 5: 
-        #     print("Finished 5 batches preview, stopping evaluation.")
-        #     break 
+        if i >= 5: 
+            print("Finished 5 batches preview, stopping evaluation.")
+            break 
 
         if not paired_mode:
             if args.evaluate:
+                degradation_model = DegradationClass()
                 imgs_lr = degradation_model(imgs_hr, scale=None)
             else:
+
+                degradation_model = DegradationClass()
                 imgs_lr = degradation_model(imgs_hr, scale=4.0)
         
         if swinir_model is not None:

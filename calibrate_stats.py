@@ -8,7 +8,10 @@ from tqdm import tqdm
 from models import mar 
 from dataset.dataset_sr import SRDataset
 from dataset.dataset_paired import PairedSRDataset 
-from dataset.codeformer import CodeFormerDegradation 
+from dataset.codeformer_face import CodeFormerDegradation as CodeFormerDegradationFace
+from dataset.codeformer_natural import CodeFormerDegradationNatural
+from models.swinir import SwinIR
+from engine_mar import preprocess_with_swinir
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAR Trajectory Confidence Calibration', add_help=False)
@@ -62,7 +65,11 @@ def get_args_parser():
     parser.add_argument('--use_dynamic_maskgit', action='store_true')
     parser.add_argument('--conf_threshold', type=float, default=0.0)
     parser.add_argument('--conf_pmin', type=float, default=0.01)
-
+    parser.add_argument('--degradation', default='codeformer', type=str,
+                        help='Degradation type: codeformer (face) or codeformer_natural')
+    
+    parser.add_argument('--use_swinir', action='store_true', help='Use SwinIR for preprocessing')
+    parser.add_argument('--swinir_ckpt', type=str, default='pretrained_models/swinir/face_swinir_v1.ckpt')
     return parser
 
 class DeltaCollector:
@@ -83,21 +90,14 @@ class DeltaCollector:
         t: int, 当前时间步
         x_start: Tensor, 当前预测的 x0 (pred_xstart)
         """
-        # 只在指定窗口内工作
         if t not in self.window_steps:
             return
         
-        # 记录上一帧，计算差分
         if self.x0_prev is not None:
-            # 计算 delta = x0_curr - x0_prev
-            # 注意：扩散是反向过程 t 大 -> t 小，所以通常是 x0(t) - x0(t+1)
-            # 能量计算是平方，所以顺序不影响
             delta = x_start - self.x0_prev 
             
-            # 将 delta 移到 CPU 以节省显存，并添加到列表
             self.deltas.append(delta.detach().cpu())
         
-        # 更新上一帧
         self.x0_prev = x_start.detach().clone()
         
     def finalize(self):
@@ -140,6 +140,46 @@ def main(args):
     # 3. 初始化 VAE
     from models.vae import AutoencoderKL
     vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).to(device).eval()
+    swinir_model = None
+    if args.use_swinir:
+        print(f"Loading SwinIR model from {args.swinir_ckpt}...")
+        # 硬编码配置 (Real-World SR Large)
+        swinir_model = SwinIR(
+            img_size=64,
+            patch_size=1,
+            in_chans=3,
+            embed_dim=180,
+            depths=[6, 6, 6, 6, 6, 6, 6, 6],
+            num_heads=[6, 6, 6, 6, 6, 6, 6, 6],
+            window_size=8,
+            mlp_ratio=2.0,
+            sf=8,
+            img_range=1.0,
+            upsampler="nearest+conv",
+            resi_connection="1conv",
+            unshuffle=True,
+            unshuffle_scale=8,
+        )
+        
+        checkpoint_swinir = torch.load(args.swinir_ckpt, map_location='cpu')
+        param_key_g = 'params_ema' if 'params_ema' in checkpoint_swinir else 'params'
+        state_dict_swinir = checkpoint_swinir[param_key_g] if param_key_g in checkpoint_swinir else checkpoint_swinir
+        
+        # 去除 module. 前缀
+        clean_state_dict = {}
+        for k, v in state_dict_swinir.items():
+            if k.startswith('module.'):
+                clean_state_dict[k[7:]] = v
+            else:
+                clean_state_dict[k] = v
+                
+        swinir_model.load_state_dict(clean_state_dict, strict=True)
+        swinir_model.to(device)
+        swinir_model.eval()
+        
+        # 冻结 SwinIR 参数
+        for param in swinir_model.parameters():
+            param.requires_grad = False
 
     # 4. 初始化数据集
     if args.lr_data_path:
@@ -159,7 +199,12 @@ def main(args):
             is_train=False, 
             degradation_type='codeformer'
         )
-        degradation_model = CodeFormerDegradation().to(device)
+        if args.degradation == 'codeformer_natural':
+            print("Initializing Natural Degradation (Fixed 4x)...")
+            degradation_model = CodeFormerDegradationNatural().to(device)
+        else:
+            print("Initializing Face Degradation (Random 1-12x)...")
+            degradation_model = CodeFormerDegradationFace().to(device)
 
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True
@@ -250,7 +295,9 @@ def main(args):
         z_sub = z[indices_to_pred]
         pos_sub = pos_embed[indices_to_pred]
         z_cond = z_sub + pos_sub
-        
+        if swinir_model is not None:
+            with torch.cuda.amp.autocast():
+                imgs_lr = preprocess_with_swinir(imgs_lr, swinir_model)
         if torch.isnan(z_cond).any():
              continue
 

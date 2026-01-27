@@ -650,7 +650,7 @@ class MAR(nn.Module):
         """
         if self._conf_stats_cache is None:
             # 修改为你校准文件的实际路径
-            fname = "pretrained_models/40_10_traj/confidence_stats_cfg1.2_temp0.9.npz"
+            fname = "pretrained_models/40_10_traj/confidence_stats_cfg1.0_temp0.9.npz"
             stats = load_confidence_stats(fname)
             
             if stats is None:
@@ -1182,7 +1182,7 @@ class MAR(nn.Module):
                 start_threshold = max(0.0, self.conf_threshold - 0.5)
                 end_threshold = self.conf_threshold + 0.1
                 ramp_steps = 6.0
-                stochastic_scale = 0.2
+                stochastic_scale = 0.0
             else:
                 start_threshold = self.conf_threshold - 1.0
                 end_threshold = self.conf_threshold + 1.5
