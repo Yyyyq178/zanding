@@ -155,7 +155,7 @@ class RealESRGANDegradationNatural:
 
             # 2.2 Resize to Target LR Size
             # 最终尺寸必须是 h//scale, w//scale
-            target_h, target_w = h // scale, w // scale
+            target_h, target_w = int(h // scale), int(w // scale)
             mode = random.choice([cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4])
             img = cv2.resize(img, (target_w, target_h), interpolation=mode)
 
