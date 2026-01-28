@@ -4,6 +4,8 @@ from torch.utils.data import Dataset
 from PIL import Image
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
+import cv2
+import numpy as np
 
 class PairedSRDataset(Dataset):
     """
@@ -36,13 +38,26 @@ class PairedSRDataset(Dataset):
         img_lr = Image.open(lr_path).convert('RGB')
 
         W, H = img_hr.size
-        if W > self.img_size and H > self.img_size:
-            i, j, h, w = transforms.RandomCrop.get_params(img_hr, output_size=(self.img_size, self.img_size))
-            img_hr = TF.crop(img_hr, i, j, h, w)
-            img_lr = TF.crop(img_lr, i, j, h, w)
+        # 如果需要 resize 
+        if not (W > self.img_size and H > self.img_size):
+            # PIL -> Numpy
+            img_hr = np.array(img_hr)
+            img_lr = np.array(img_lr)
+            
+            # 使用 cv2.resize 
+            img_hr = cv2.resize(img_hr, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+            img_lr = cv2.resize(img_lr, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+            
+            # Numpy -> Tensor 
+            from PIL import Image
+            img_hr = Image.fromarray(img_hr)
+            img_lr = Image.fromarray(img_lr)
+            
         else:
-            img_hr = TF.resize(img_hr, (self.img_size, self.img_size))
-            img_lr = TF.resize(img_lr, (self.img_size, self.img_size))
+             i, j, h, w = transforms.RandomCrop.get_params(
+                img_hr, output_size=(self.img_size, self.img_size))
+             img_hr = TF.crop(img_hr, i, j, h, w)
+             img_lr = TF.crop(img_lr, i, j, h, w)
 
         return self.normalize(img_hr), self.normalize(img_lr), self.hr_files[index]
 

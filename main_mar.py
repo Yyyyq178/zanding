@@ -89,7 +89,7 @@ def get_args_parser():
                         help='lin, cos, lin0.5, etc.')
     parser.add_argument('--warmup_epochs', type=int, default=0, 
                         help='If 0, will use --wp ratio to calculate. Manually set to override.')
-    parser.add_argument('--wp', type=float, default=0.1, 
+    parser.add_argument('--wp', type=float, default=0.05, 
                         help='Warmup ratio of total epochs. Used if warmup_epochs is 0')
     parser.add_argument('--wp0', type=float, default=0.005, 
                         help='Initial lr ratio (relative to peak)')
@@ -251,8 +251,7 @@ def main(args):
                 drop_last=True,
             )
 
-    # 验证集/测试集加载 (核心修改部分)
-    # 这里的 import 放在这里是为了防止在没有该文件时影响训练
+    # 验证集/测试集加载
     from dataset.dataset_paired import PairedSRDataset, HROnlyDataset 
 
     if getattr(args, 'paired_test', False) and getattr(args, 'lr_data_path', None) is not None:
@@ -265,8 +264,6 @@ def main(args):
         )
     
     elif args.evaluate:
-        # 纯 HR 测试 (自动退化，读取扁平文件夹)
-        # 这就是解决你 FileNotFoundError 的关键
         print(f"Loading HR-Only Test Dataset from {args.hr_data_path} (Flat Folder)")
         dataset_val = HROnlyDataset(
             root_hr=args.hr_data_path,

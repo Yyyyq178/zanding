@@ -175,7 +175,7 @@ class RealESRGANDegradationNatural:
             # 2.5 JPEG Compression
             if np.random.uniform() < 0.9:
                 img = random_add_jpg_compression(img, quality_range=self.jpeg_range2)
-
+            img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
             imgs_lr_list.append(img)
 
         # 3. 后处理：Stack -> Numpy -> Tensor -> [-1, 1]

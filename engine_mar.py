@@ -129,7 +129,7 @@ def train_one_epoch(model, vae,
 
     if args.degradation == 'realesrgan_natural':
         degradation_model = RealESRGANDegradationNatural()
-        if misc.get_rank() == 0 and data_iter_step == 0:
+        if misc.get_rank() == 0 and epoch == 0:
             print("Using Natural Degradation: Real-ESRGAN (High-Order)")
     else:
         degradation_model = CodeFormerDegradationFace()

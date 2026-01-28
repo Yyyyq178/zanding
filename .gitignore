@@ -32,6 +32,7 @@ logs
 *.json
 extract_images.py
 debug_log.txt
+debug_log1.txt
 1/
 DIV2K_Val/
 DRealSR/
