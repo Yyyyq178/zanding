@@ -10,12 +10,12 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --batch_size 1 \
     --eval_bsz 16 \
     --img_size 512 \
-    --resume output_Resume \
+    --resume output_Resume_harder \
     --evaluate \
-    --temperature 0.95 \
+    --temperature 1.0 \
     --paired_test \
-    --hr_data_path /root/autodl-tmp/zanding/CelebA-Test-400/HQ \
-    --lr_data_path /root/autodl-tmp/zanding/CelebA-Test-400/LQ \
+    --hr_data_path /root/autodl-tmp/zanding/CelebA-Test-3000/HQ \
+    --lr_data_path /root/autodl-tmp/zanding/CelebA-Test-3000/LQ \
     --use_lr_inject \
     --use_rope \
     --use_mse_loss \
@@ -24,7 +24,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --conf_pmin 0.05 \
     --conf_method stats \
     --conf_window '40:10' \
-    --output_dir Evaluate_Resume_16_X0——0.95
+    --output_dir Evaluate_Resume_hard_old
     #--cfg_scale 1.2 \
     #--predictor_ckpt output_predictor/predictor_latest.pth \
     

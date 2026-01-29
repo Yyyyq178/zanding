@@ -17,14 +17,14 @@ python calibrate_stats.py \
     --diffloss_w 1024 \
     --num_sampling_steps "ddim100" \
     --degradation codeformer \
-    --resume "output_Resume/checkpoint-last.pth" \
+    --resume "output_Resume_harder/checkpoint-last.pth" \
     --hr_data_path "/root/autodl-tmp/zanding/CelebA-Test-3000/HQ" \
     --lr_data_path "/root/autodl-tmp/zanding/CelebA-Test-3000/LQ" \
-    --output_dir "pretrained_models/40_10_traj" \
+    --output_dir "pretrained_models/40_10_harder_old" \
     --batch_size 8 \
     --calib_batches 50 \
     --conf_window "40:10" \
-    --temperature 0.95 \
+    --temperature 1.0 \
     --use_lr_inject \
     --use_rope \
     --use_mse_loss

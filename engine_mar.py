@@ -278,9 +278,9 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         imgs_hr = imgs_hr.cuda(args.device, non_blocking=True)
         imgs_lr = imgs_lr.cuda(args.device, non_blocking=True)
 
-        if i >= 5: 
-            print("Finished 5 batches preview, stopping evaluation.")
-            break 
+        # if i >= 5: 
+        #     print("Finished 5 batches preview, stopping evaluation.")
+        #     break 
 
         if not paired_mode:
             if args.evaluate:

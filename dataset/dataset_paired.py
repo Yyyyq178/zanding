@@ -49,7 +49,6 @@ class PairedSRDataset(Dataset):
             img_lr = cv2.resize(img_lr, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
             
             # Numpy -> Tensor 
-            from PIL import Image
             img_hr = Image.fromarray(img_hr)
             img_lr = Image.fromarray(img_lr)
             
