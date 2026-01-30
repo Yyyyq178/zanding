@@ -644,7 +644,7 @@ class MAR(nn.Module):
         """
         if self._conf_stats_cache is None:
             # 修改为你校准文件的实际路径
-            fname = "pretrained_models/40_10_harder_old/confidence_stats_cfg1.0_temp1.0.npz"
+            fname = "pretrained_models/40_10_harder_new/confidence_stats_cfg1.0_temp1.0.npz"
             stats = load_confidence_stats(fname)
             
             if stats is None:

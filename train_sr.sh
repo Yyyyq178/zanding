@@ -9,7 +9,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --vae_embed_dim 16 \
     --vae_stride 16 \
     --patch_size 1 \
-    --epochs 600 \
+    --epochs 1500 \
     --batch_size 8 \
     --grad_clip 1.0 \
     --cfg_drop_prob 0.1 \
@@ -18,6 +18,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --hr_data_path /root/autodl-tmp/zanding/data \
     --val_data_path /root/autodl-tmp/zanding/data \
     --output_dir output_Resume_harder \
+    --resume output_Resume_harder \
     --degradation codeformer \
     --eval_freq 4 \
     --save_last_freq 2 \
@@ -25,6 +26,8 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --img_size 512 \
     --sche lin0 \
     --multi_scale \
+    --use_swinir \
+    --swinir_ckpt pretrained_models/swinir/swinir_restoration512_L1.pth \
     --use_lr_inject \
     --use_rope \
     --use_mse_loss \
