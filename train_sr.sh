@@ -17,7 +17,7 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --lr 5.0e-4 \
     --hr_data_path /root/autodl-tmp/zanding/data \
     --val_data_path /root/autodl-tmp/zanding/data \
-    --output_dir output_Resume_harder \
+    --output_dir output_Resume_harder_swinir \
     --resume output_Resume_harder \
     --degradation codeformer \
     --eval_freq 4 \

@@ -17,14 +17,14 @@ python calibrate_stats.py \
     --diffloss_w 1024 \
     --num_sampling_steps "ddim100" \
     --degradation codeformer \
-    --resume "output_Resume_harder/checkpoint-last.pth" \
-    --hr_data_path "CelebA-Test-3000/HQ" \
-    --lr_data_path "CelebA-Test-3000/LQ" \
-    --output_dir "pretrained_models/40_10_harder_old" \
+    --resume "output_Resume_harder_swinir/checkpoint-last.pth" \
+    --hr_data_path "CelebA-Test-3000-new/HR" \
+    --lr_data_path "CelebA-Test-3000-new/LR" \
+    --output_dir "pretrained_models/40_10_harder_swinir" \
     --batch_size 16 \
     --calib_batches 500 \
     --conf_window "40:10" \
-    --temperature 1.0 \
+    --temperature 0.95 \
     --use_swinir \
     --swinir_ckpt pretrained_models/swinir/swinir_restoration512_L1.pth \
     --use_lr_inject \

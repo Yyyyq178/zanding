@@ -162,8 +162,14 @@ def main(args):
         )
         
         checkpoint_swinir = torch.load(args.swinir_ckpt, map_location='cpu')
-        param_key_g = 'params_ema' if 'params_ema' in checkpoint_swinir else 'params'
-        state_dict_swinir = checkpoint_swinir[param_key_g] if param_key_g in checkpoint_swinir else checkpoint_swinir
+        if 'params_ema' in checkpoint_swinir:
+            state_dict_swinir = checkpoint_swinir['params_ema']
+        elif 'params' in checkpoint_swinir:
+            state_dict_swinir = checkpoint_swinir['params']
+        elif 'state_dict' in checkpoint_swinir:
+            state_dict_swinir = checkpoint_swinir['state_dict']
+        else:
+            state_dict_swinir = checkpoint_swinir
         
         # 去除 module. 前缀
         clean_state_dict = {}
@@ -388,7 +394,7 @@ def main(args):
         conf_window_str = args.conf_window.replace(":", "_") if args.conf_window else "all"
         
         # 文件名带上 cfg_scale 和 temperature，方便管理
-        save_name = f"confidence_stats_cfg{args.cfg_scale:.1f}_temp{args.temperature:.1f}.npz"
+        save_name = f"confidence_stats_cfg{args.cfg_scale:.1f}_temp{args.temperature:.2f}.npz"
         save_path = os.path.join(args.output_dir, save_name)
         
         np.savez(save_path, sigma_delta=sigma_delta_np)
