@@ -544,13 +544,19 @@ def main(args):
 
         long_term_freq = 50
         if (epoch % long_term_freq == 0 and epoch > 0) or epoch + 1 == args.epochs:
-            # 保存当前的长周期存档 
-            misc.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, 
-                optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch, 
-                ema_params=ema_params, 
-                epoch_name=str(epoch) 
-            )
+            to_save = {
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+                'scaler': loss_scaler.state_dict(),
+                'args': args,
+                'vae_lora': peft.get_peft_model_state_dict(vae.encoder) # 关键！
+            }
+            if ema_params is not None:
+                to_save['model_ema'] = ema_params
+            
+            save_path = os.path.join(args.output_dir, f'checkpoint-{epoch}.pth')
+            torch.save(to_save, save_path)
         if misc.is_main_process():
                 try:
                     # 获取所有带数字的权重文件
@@ -565,19 +571,15 @@ def main(args):
                         
                         # 尝试解析文件名中的数字
                         try:
-                            # 提取数字，例如 "checkpoint-200.pth" -> 200
                             e_num = int(fname.replace('checkpoint-', '').replace('.pth', ''))
                             
-                            # 只管理那些符合长周期倍数的文件 (防止误删其他手动存的文件)
                             if e_num % long_term_freq == 0:
                                 long_term_ckpts.append((e_num, p))
                         except ValueError:
                             continue 
 
-                    # 按 epoch 从大到小排序 (300, 250, 200...)
                     long_term_ckpts.sort(key=lambda x: x[0], reverse=True)
                     
-                    # 只保留最近的 2 个 (例如 300 和 250)
                     keep_num = 2 
                     if len(long_term_ckpts) > keep_num:
                         # 删除多余的 (例如 200, 150...)
@@ -602,12 +604,20 @@ def main(args):
             # 只有创新高才保存/覆盖
             if current_psnr > best_psnr:
                 best_psnr = current_psnr
-                misc.save_model(
-                    args=args, model=model, model_without_ddp=model_without_ddp, 
-                    optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch, 
-                    ema_params=ema_params, 
-                    epoch_name="best" # 覆盖 checkpoint-best.pth
-                )
+                to_save = {
+                    'model': model_without_ddp.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'epoch': epoch,
+                    'scaler': loss_scaler.state_dict(),
+                    'args': args,
+                    'vae_lora': peft.get_peft_model_state_dict(vae.encoder)
+                }
+                if ema_params is not None:
+                    to_save['model_ema'] = ema_params
+                
+                save_path = os.path.join(args.output_dir, f'checkpoint-{epoch}.pth')
+                torch.save(to_save, save_path)
+
                 if misc.is_main_process():
                     print(f"New Best PSNR: {best_psnr:.2f}! Saved checkpoint-best.pth")
             
