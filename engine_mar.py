@@ -161,11 +161,17 @@ def train_one_epoch(model, vae,
         with torch.no_grad():
             if args.use_cached:
                 raise NotImplementedError("Cached mode not supported for SR yet.")
-            posterior_hr = vae.encode(samples_hr)
+            
+            if hasattr(vae.encoder, "disable_adapters"):
+                with vae.encoder.disable_adapters():
+                    posterior_hr = vae.encode(samples_hr)
+            else:
+                posterior_hr = vae.encode(samples_hr)
+                
             x_hr = posterior_hr.sample().mul_(0.2325)
 
-            posterior_lr = vae.encode(samples_lr)
-            x_lr = posterior_lr.sample().mul_(0.2325)
+        posterior_lr = vae.encode(samples_lr)
+        x_lr = posterior_lr.sample().mul_(0.2325)
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             model_out = model(

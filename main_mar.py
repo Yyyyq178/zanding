@@ -5,6 +5,8 @@ import os
 import time
 import glob
 from pathlib import Path
+from peft import LoraConfig, get_peft_model
+import peft
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -139,8 +141,8 @@ def get_args_parser():
     parser.add_argument('--mse_weight', default=0.2, type=float, help='Weight for MSE loss')
     parser.add_argument('--use_perceptual_loss', action='store_true',
                         help='Enable perceptual loss (LPIPS/DISTS).')
-    parser.add_argument('--perceptual_weight', type=float, default=0.5, 
-                        help='Weight for perceptual loss. Default 0.5.')
+    parser.add_argument('--perceptual_weight', type=float, default=0.2, 
+                        help='Weight for perceptual loss. Default 0.2.')
     parser.add_argument('--perceptual_metric', type=str, default='lpips', choices=['lpips', 'dists'],
                         help='Type of perceptual metric: lpips or dists')
     # Dataset parameters
@@ -311,6 +313,13 @@ def main(args):
     vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).cuda().eval()
     for param in vae.parameters():
         param.requires_grad = False
+    vae_lora_config = LoraConfig(
+        r=4, 
+        lora_alpha=4, 
+        target_modules=["conv1", "conv2", "conv_in", "conv_out", "q", "k", "v", "proj_out"],
+        lora_dropout=0.0,
+    )
+    vae.encoder = get_peft_model(vae.encoder, vae_lora_config)
 
     vae_param_stats = misc.count_parameters(vae)
     print("VAE total parameters: {:.2f}M".format(vae_param_stats["total"] / 1e6))
@@ -445,6 +454,15 @@ def main(args):
                  
     # no weight decay on bias, norm layers, and diffloss MLP
     param_groups = misc.add_weight_decay(model_without_ddp, args.weight_decay)
+    param_groups = misc.add_weight_decay(model_without_ddp, args.weight_decay)
+
+    vae_trainable_params = [p for p in vae.encoder.parameters() if p.requires_grad]
+    if len(vae_trainable_params) > 0:
+        print(f"Adding {len(vae_trainable_params)} VAE Encoder LoRA parameters to optimizer.")
+        param_groups.append({
+            'params': vae_trainable_params, 
+            'weight_decay': args.weight_decay
+        })
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     print(optimizer)
     loss_scaler = NativeScaler()
@@ -462,12 +480,13 @@ def main(args):
             if name in ema_state_dict:
                 ema_params.append(ema_state_dict[name].cuda())
             else:
-                # 这种情况通常发生在加入了新的 Predictor 参数，但 Checkpoint 是旧的时候
-                # 直接使用当前的参数（即刚刚加载的 Predictor 权重）作为 EMA 的初始值
                 ema_params.append(p.data.clone())
-        # ema_params = [ema_state_dict[name].cuda() for name, _ in model_without_ddp.named_parameters()]
         print("Resume checkpoint %s" % args.resume)
-
+        if 'vae_lora' in checkpoint:
+            print("Loading VAE Encoder LoRA weights from checkpoint...")
+            peft.set_peft_model_state_dict(vae.encoder, checkpoint['vae_lora'])
+        else:
+            print("WARNING: No VAE LoRA weights found in checkpoint!")
         if 'optimizer' in checkpoint and 'epoch' in checkpoint and not args.evaluate:
             optimizer.load_state_dict(checkpoint['optimizer'])
             args.start_epoch = checkpoint['epoch'] + 1
@@ -505,8 +524,23 @@ def main(args):
         )
         # save checkpoint
         if epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs:
-            misc.save_model(args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                            loss_scaler=loss_scaler, epoch=epoch, ema_params=ema_params, epoch_name="last")
+            to_save = {
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+                'scaler': loss_scaler.state_dict(),
+                'args': args,
+                'vae_lora':  peft.get_peft_model_state_dict(vae.encoder) 
+            }
+            if ema_params is not None:
+                to_save['model_ema'] = ema_params
+
+            save_path = os.path.join(args.output_dir, f'checkpoint-last.pth')
+            torch.save(to_save, save_path)
+
+            # print(f"Saved checkpoint with VAE LoRA to {save_path}")
+            # misc.save_model(args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+            #                 loss_scaler=loss_scaler, epoch=epoch, ema_params=ema_params, epoch_name="last")
 
         long_term_freq = 50
         if (epoch % long_term_freq == 0 and epoch > 0) or epoch + 1 == args.epochs:
