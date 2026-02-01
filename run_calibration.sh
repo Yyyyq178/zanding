@@ -17,10 +17,10 @@ python calibrate_stats.py \
     --diffloss_w 1024 \
     --num_sampling_steps "ddim100" \
     --degradation codeformer \
-    --resume "output_Resume_harder_swinir/checkpoint-last.pth" \
+    --resume "output_Resume_harder_swinir——12/checkpoint-last.pth" \
     --hr_data_path "CelebA-Test-3000-new/HR" \
     --lr_data_path "CelebA-Test-3000-new/LR" \
-    --output_dir "pretrained_models/40_10_harder_swinir" \
+    --output_dir "pretrained_models/40_10_harder_swinir——12" \
     --batch_size 16 \
     --calib_batches 500 \
     --conf_window "40:10" \

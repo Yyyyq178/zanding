@@ -13,6 +13,7 @@ from dataset.realesrgan_natural import RealESRGANDegradationNatural
 import pyiqa
 import shutil
 import cv2
+import pyiqa
 import numpy as np
 import os
 import copy
@@ -134,6 +135,12 @@ def train_one_epoch(model, vae,
     else:
         degradation_model = CodeFormerDegradationFace()
 
+    if args.use_perceptual_loss:
+        perceptual_loss_fn = pyiqa.create_metric(args.perceptual_metric, device=device, as_loss=True)
+        print(f"Initialized {args.perceptual_metric.upper()} loss with weight {args.perceptual_weight}")
+    else:
+        perceptual_loss_fn = None
+
     gate_multiplier = 1.0
 
     for data_iter_step, (samples_hr, samples_lr, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
@@ -164,7 +171,22 @@ def train_one_epoch(model, vae,
             model_out = model(
                 x_hr, x_lr, gate_multiplier=gate_multiplier,
             )
-            loss, loss_diff, loss_mse = model_out
+            if len(model_out) == 4:
+                loss, loss_diff, loss_mse, z_pred = model_out
+            else:
+                loss, loss_diff, loss_mse = model_out
+                z_pred = None
+            loss_lpips = torch.tensor(0.0, device=device)
+
+            if args.use_perceptual_loss and perceptual_loss_fn is not None:
+                pred_imgs = vae.decode(z_pred / 0.2325)
+                
+                pred_imgs = (pred_imgs + 1) / 2
+                gt_imgs = (samples_hr + 1) / 2
+
+                loss_lpips = perceptual_loss_fn(pred_imgs, gt_imgs).mean()
+
+                loss = loss + args.perceptual_weight * loss_lpips
 
             loss_value = loss.item()
 
@@ -180,6 +202,8 @@ def train_one_epoch(model, vae,
         metric_logger.update(loss=loss_value)
         metric_logger.update(loss_diff=loss_diff.item())
         metric_logger.update(loss_mse=loss_mse.item())
+        if perceptual_loss_fn is not None:
+            metric_logger.update(loss_lpips=loss_lpips.item())
 
         if args.use_lr_inject:
             model_ref = model.module if hasattr(model, "module") else model
@@ -193,11 +217,15 @@ def train_one_epoch(model, vae,
         loss_value_reduce = misc.all_reduce_mean(loss_value)
         loss_diff_mean = misc.all_reduce_mean(loss_diff.item())
         loss_mse_mean = misc.all_reduce_mean(loss_mse.item())
+        if perceptual_loss_fn is not None:
+             loss_lpips_mean = misc.all_reduce_mean(loss_lpips.item())
         if log_writer is not None:
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
             log_writer.add_scalar('train_loss_diff', loss_diff_mean, epoch_1000x)
             log_writer.add_scalar('train_loss_mse', loss_mse_mean, epoch_1000x)
+            if perceptual_loss_fn is not None:
+                log_writer.add_scalar('train_loss_lpips', loss_lpips_mean, epoch_1000x)
             log_writer.add_scalar('lr', lr, epoch_1000x)
 
     metric_logger.synchronize_between_processes()
@@ -290,7 +318,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
 
                 degradation_model = DegradationClass()
                 imgs_lr = degradation_model(imgs_hr, scale=4.0)
-        
+        imgs_lr_raw = imgs_lr.clone()
         if swinir_model is not None:
             imgs_lr = preprocess_with_swinir(imgs_lr, swinir_model, args.swinir_batch)
 
@@ -370,7 +398,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
 
         # 保存图片 (调用辅助函数)
         if misc.get_rank() == 0:
-            save_comparison_images(sampled_images, imgs_hr, imgs_lr, save_folder, i)
+            save_comparison_images(sampled_images, imgs_hr, imgs_lr, imgs_lr_raw, save_folder, i)
 
     if misc.is_dist_avail_and_initialized():
         torch.distributed.barrier()
@@ -386,7 +414,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         print("Switch back from ema")
         model_without_ddp.load_state_dict(model_state_dict)
 
-    # 同步所有显卡的统计数据 (这一步非常重要，否则你看到的只有主卡的分数)
+    # 同步所有显卡的统计数据
     metric_logger.synchronize_between_processes()
     
     print("Averaged Validation stats:", metric_logger)
@@ -403,7 +431,6 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
     
     # 如果配置了 Tensorboard，写入验证集指标
     if log_writer is not None:
-        # 注意：这里假设你在第二步中已经像 metric_logger.update(psnr=...) 那样添加了这些 key
         for name, meter in metric_logger.meters.items():
             log_writer.add_scalar(f'val/{name}', meter.global_avg, epoch)
 
@@ -472,7 +499,7 @@ def save_sr_hr_images(sr, hr, filenames, sr_dir, hr_dir, batch_idx):
 
         cv2.imwrite(sr_path, sr_img)
         cv2.imwrite(hr_path, hr_img)
-def save_comparison_images(sr, hr, lr, save_folder, batch_idx):
+def save_comparison_images(sr, hr, lr, lr_raw, save_folder, batch_idx):
     # 辅助函数：把 Tensor 转为 numpy 图片
     def process(x):
         # --- 第一步：诊断是否炸了 ---
@@ -498,9 +525,11 @@ def save_comparison_images(sr, hr, lr, save_folder, batch_idx):
     lr_upscaled = F.interpolate(lr, size=sr.shape[-2:], mode='nearest')
     lr_np = process(lr_upscaled)
     
+    lr_raw_upscaled = F.interpolate(lr_raw, size=sr.shape[-2:], mode='nearest')
+    lr_raw_np = process(lr_raw_upscaled)
     # 遍历这个 batch 里的每张图并保存
     for j in range(sr_np.shape[0]):
-        combined = np.concatenate([lr_np[j], sr_np[j], hr_np[j]], axis=1)
+        combined = np.concatenate([lr_raw_np[j], lr_np[j], sr_np[j], hr_np[j]], axis=1)
         combined = (combined * 255).astype(np.uint8)
         combined = cv2.cvtColor(combined, cv2.COLOR_RGB2BGR)
         

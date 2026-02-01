@@ -137,6 +137,12 @@ def get_args_parser():
     parser.add_argument('--use_mse_loss', action='store_true',
                         help='Enable MSE loss component')
     parser.add_argument('--mse_weight', default=0.2, type=float, help='Weight for MSE loss')
+    parser.add_argument('--use_perceptual_loss', action='store_true',
+                        help='Enable perceptual loss (LPIPS/DISTS).')
+    parser.add_argument('--perceptual_weight', type=float, default=0.5, 
+                        help='Weight for perceptual loss. Default 0.5.')
+    parser.add_argument('--perceptual_metric', type=str, default='lpips', choices=['lpips', 'dists'],
+                        help='Type of perceptual metric: lpips or dists')
     # Dataset parameters
     parser.add_argument('--hr_data_path', default=None, type=str,
                         help='dataset path for High Resolution images')
@@ -303,15 +309,16 @@ def main(args):
     )
 # define the vae and mar model
     vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).cuda().eval()
+    for param in vae.parameters():
+        param.requires_grad = False
+
     vae_param_stats = misc.count_parameters(vae)
     print("VAE total parameters: {:.2f}M".format(vae_param_stats["total"] / 1e6))
     print("VAE trainable parameters: {:.2f}M".format(vae_param_stats["trainable"] / 1e6))
     if log_writer is not None:
         log_writer.add_scalar('params/vae_total_millions', vae_param_stats["total"] / 1e6, 0)
         log_writer.add_scalar('params/vae_trainable_millions', vae_param_stats["trainable"] / 1e6, 0)
-    for param in vae.parameters():
-        param.requires_grad = False
-
+        
     swinir_model = None
     if args.use_swinir:
         print("Initializing SwinIR for LR preprocessing...")

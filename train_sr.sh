@@ -31,4 +31,5 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --use_lr_inject \
     --use_rope \
     --use_mse_loss \
+    --use_perceptual_loss \
     --online_eval

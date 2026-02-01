@@ -644,7 +644,7 @@ class MAR(nn.Module):
         """
         if self._conf_stats_cache is None:
             # 修改为你校准文件的实际路径
-            fname = "pretrained_models/40_10_harder_new/confidence_stats_cfg1.0_temp1.0.npz"
+            fname = "pretrained_models/40_10_harder_swinir——12/confidence_stats_cfg1.0_temp0.95.npz"
             stats = load_confidence_stats(fname)
             
             if stats is None:
@@ -988,8 +988,9 @@ class MAR(nn.Module):
 
         # lossW
         loss, loss_diff, loss_mse = self.forward_loss(z=z, pos_embed=pos_embed, target=gt_latents, mask=mask)
-        
-        return loss, loss_diff, loss_mse
+        z_projected = self.final_proj(z) 
+        z_map = self.unpatchify(z_projected, shape=shape_hr)
+        return loss, loss_diff, loss_mse, z_map
 
     def sample_tokens(self, bsz, num_iter=64, x_lr=None,
                       temperature=1.0, progress=False,
