@@ -10,6 +10,7 @@ output_*/
 Evaluate_*/
 *.pth
 *.ckpt
+*.dat
 *.safetensors
 images_codeformer_swinir/
 
@@ -27,14 +28,16 @@ CelebA-Test-3000/
 CelebA-Test-300/
 CelebA-Test-400/
 CelebA-Test-3000-new/
+LFW-Test/
+WebPhoto-Test/
+Wider-Test/
+calc_fid_stats.py
 
 #其他
 logs
 *.json
 extract_images.py
-debug_log.txt
-debug_log1.txt
-debug_log2.txt
+debug_log*.txt
 1/
 DIV2K_Val/
 DRealSR/

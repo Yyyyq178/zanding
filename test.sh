@@ -10,12 +10,11 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --batch_size 1 \
     --eval_bsz 16 \
     --img_size 512 \
-    --resume output_Resume_harder_swinir \
+    --resume output_Resume_non_dists_new \
     --evaluate \
     --temperature 0.95 \
-    --paired_test \
-    --hr_data_path CelebA-Test-3000-new/HR \
-    --lr_data_path CelebA-Test-3000-new/LR \
+    --only_lr_test \
+    --lr_data_path WebPhoto-Test \
     --use_swinir \
     --swinir_ckpt pretrained_models/swinir/swinir_restoration512_L1.pth \
     --use_lr_inject \
@@ -25,8 +24,8 @@ torchrun --nproc_per_node=1 --master_port=$MASTER_PORT main_mar.py \
     --conf_threshold 1.0 \
     --conf_pmin 0.05 \
     --conf_method stats \
-    --conf_window '40:10' \
-    --output_dir Evaluate_Resume_hard_swinir
+    --conf_window '30:10' \
+    --output_dir Evaluate_Resume_WebPhoto
     #--cfg_scale 1.2 \
     #--predictor_ckpt output_predictor/predictor_latest.pth \
     

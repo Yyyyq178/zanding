@@ -108,3 +108,37 @@ class HROnlyDataset(Dataset):
 
     def __len__(self):
         return len(self.hr_files)
+
+class SingleLRDataset(Dataset):
+    """
+    [纯推理模式] 只有 LR,不需要 HR
+    """
+    def __init__(self, root_lr, img_size=512):
+        super().__init__()
+        self.root_lr = root_lr
+        self.img_size = img_size
+        
+        if not os.path.isdir(root_lr):
+            raise ValueError(f"LR directory not found: {root_lr}")
+
+        self.lr_files = sorted([f for f in os.listdir(root_lr) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp'))])
+        print(f"[SingleLRDataset] Loaded {len(self.lr_files)} images from {root_lr}")
+
+        self.normalize = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+        ])
+
+    def __getitem__(self, index):
+        lr_path = os.path.join(self.root_lr, self.lr_files[index])
+        img_lr = Image.open(lr_path).convert('RGB')
+
+        img_lr = np.array(img_lr)
+        img_lr = cv2.resize(img_lr, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+        img_lr = Image.fromarray(img_lr)
+        lq_tensor = self.normalize(img_lr)
+
+        return lq_tensor, lq_tensor, self.lr_files[index]
+
+    def __len__(self):
+        return len(self.lr_files)

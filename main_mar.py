@@ -11,6 +11,7 @@ import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
+from dataset.dataset_paired import PairedSRDataset, HROnlyDataset, SingleLRDataset
 
 from util.crop import center_crop_arr
 import util.misc as misc
@@ -144,6 +145,8 @@ def get_args_parser():
                     help='dataset path for Low Resolution images (for paired testing)')
     parser.add_argument('--paired_test', action='store_true',
                     help='Use paired HR/LR dataset for evaluation')
+    parser.add_argument('--only_lr_test', action='store_true',
+                    help='Use only LR dataset for inference (no HR needed)')
     parser.add_argument('--val_data_path', default=None, type=str,
                         help='dataset path for validation (optional). If None, use hr_data_path/val')
     parser.add_argument('--steps_per_epoch', default=-1, type=int,
@@ -252,17 +255,19 @@ def main(args):
             )
 
     # 验证集/测试集加载
-    from dataset.dataset_paired import PairedSRDataset, HROnlyDataset 
-
     if getattr(args, 'paired_test', False) and getattr(args, 'lr_data_path', None) is not None:
-        # [模式 A] 成对测试 (HR + LR)
         print(f"Loading Paired Test Dataset from {args.hr_data_path} and {args.lr_data_path}")
         dataset_val = PairedSRDataset(
             root_hr=args.hr_data_path, 
             root_lr=args.lr_data_path, 
             img_size=args.img_size
         )
-    
+    elif getattr(args, 'only_lr_test', False):
+        print(f"Loading Single LR Test Dataset from {args.lr_data_path}")
+        dataset_val = SingleLRDataset(
+            root_lr=args.lr_data_path,
+            img_size=args.img_size
+        )
     elif args.evaluate:
         print(f"Loading HR-Only Test Dataset from {args.hr_data_path} (Flat Folder)")
         dataset_val = HROnlyDataset(
@@ -271,7 +276,6 @@ def main(args):
         )
         
     else:
-        # 训练时的验证 (需要标准 ImageFolder 结构)
         if args.val_data_path is not None:
             val_root = args.val_data_path
         else:
@@ -303,15 +307,14 @@ def main(args):
     )
 # define the vae and mar model
     vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).cuda().eval()
+    for param in vae.parameters():
+        param.requires_grad = False
+        
     vae_param_stats = misc.count_parameters(vae)
-    print("VAE total parameters: {:.2f}M".format(vae_param_stats["total"] / 1e6))
-    print("VAE trainable parameters: {:.2f}M".format(vae_param_stats["trainable"] / 1e6))
     if log_writer is not None:
         log_writer.add_scalar('params/vae_total_millions', vae_param_stats["total"] / 1e6, 0)
         log_writer.add_scalar('params/vae_trainable_millions', vae_param_stats["trainable"] / 1e6, 0)
-    for param in vae.parameters():
-        param.requires_grad = False
-
+        
     swinir_model = None
     if args.use_swinir:
         print("Initializing SwinIR for LR preprocessing...")
@@ -374,7 +377,8 @@ def main(args):
         swinir_model.to(device)
         for param in swinir_model.parameters():
             param.requires_grad = False
-    
+        swinir_stats = misc.count_parameters(swinir_model)
+        print("SwinIR total parameters: {:.2f}M".format(swinir_stats["total"] / 1e6))
     model = mar.__dict__[args.model](
         img_size=args.img_size,
         vae_stride=args.vae_stride,
@@ -404,10 +408,25 @@ def main(args):
     )
 
     print("Model = %s" % str(model))
-    # following timm: set wd as 0 for bias and norm layers
     param_stats = misc.count_parameters(model)
-    print("Total parameters: {:.2f}M".format(param_stats["total"] / 1e6))
-    print("Number of trainable parameters: {:.2f}M".format(param_stats["trainable"] / 1e6))
+    print("=" * 40)
+    print("详细参数统计 (Detailed Parameter Stats):")
+    print(f"  [1] MAR Model (主模型):     {param_stats['total']/1e6:.2f} M")
+    print(f"  [2] VAE (w/ LoRA):          {vae_param_stats['total']/1e6:.2f} M")
+    swinir_total = 0
+    if args.use_swinir and swinir_model is not None:
+        swinir_stats = misc.count_parameters(swinir_model)
+        swinir_total = swinir_stats['total']
+        print(f"  [3] SwinIR (预处理):        {swinir_total/1e6:.2f} M")
+    else:
+        print(f"  [3] SwinIR:                 未使用 (0 M)")
+    grand_total = param_stats['total'] + vae_param_stats['total'] + swinir_total
+    grand_trainable = param_stats['trainable'] + vae_param_stats['trainable']
+
+    print("-" * 40)
+    print(f"系统总参数量 (System Total):   {grand_total/1e6:.2f} M")
+    print(f"总可训练参数 (Total Trainable): {grand_trainable/1e6:.2f} M")
+    print("=" * 40)
     if log_writer is not None:
         log_writer.add_scalar('params/total_millions', param_stats["total"] / 1e6, 0)
         log_writer.add_scalar('params/trainable_millions', param_stats["trainable"] / 1e6, 0)
@@ -475,8 +494,9 @@ def main(args):
 
     if args.evaluate:
         torch.cuda.empty_cache()
+        is_paired_mode = getattr(args, 'paired_test', False) or getattr(args, 'only_lr_test', False)
         evaluate(model_without_ddp, vae, ema_params, args, 0, batch_size=args.eval_bsz, log_writer=log_writer,
-                 use_ema=True, data_loader=data_loader_val, paired_mode=args.paired_test,
+                 use_ema=True, data_loader=data_loader_val, paired_mode=is_paired_mode,
                  swinir_model=swinir_model)
         return
     best_psnr = -1.0

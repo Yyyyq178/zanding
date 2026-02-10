@@ -1,8 +1,5 @@
 #!/bin/bash
 
-# 显存设置 (如果需要)
-# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
 echo "Starting Calibration..."
 
 # 运行校准脚本
@@ -17,13 +14,13 @@ python calibrate_stats.py \
     --diffloss_w 1024 \
     --num_sampling_steps "ddim100" \
     --degradation codeformer \
-    --resume "output_Resume_harder_swinir/checkpoint-last.pth" \
+    --resume "output_Resume_non_dists_new/checkpoint-last.pth" \
     --hr_data_path "CelebA-Test-3000-new/HR" \
     --lr_data_path "CelebA-Test-3000-new/LR" \
-    --output_dir "pretrained_models/40_10_harder_swinir" \
+    --output_dir "pretrained_models/30_10_non_dists1" \
     --batch_size 16 \
     --calib_batches 500 \
-    --conf_window "40:10" \
+    --conf_window "30:10" \
     --temperature 0.95 \
     --use_swinir \
     --swinir_ckpt pretrained_models/swinir/swinir_restoration512_L1.pth \
